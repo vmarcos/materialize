@@ -29,7 +29,7 @@
 //! from compacting beyond the allowed compaction of each of its outputs, ensuring that we can
 //! recover each dataflow to its current state in case of failure or other reconfiguration.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::num::{NonZeroI64, NonZeroUsize};
 use std::str::FromStr;
@@ -41,7 +41,6 @@ use chrono::{DateTime, Utc};
 use differential_dataflow::lattice::Lattice;
 use futures::stream::BoxStream;
 use futures::{future, FutureExt};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use timely::progress::frontier::{AntichainRef, MutableAntichain};
 use timely::progress::{Antichain, Timestamp};
@@ -57,6 +56,7 @@ use mz_repr::{GlobalId, Row};
 use mz_storage_client::controller::{ReadPolicy, StorageController};
 
 use crate::logging::{LogVariant, LogView, LoggingConfig};
+use crate::protocol::command::ComputeParameters;
 use crate::protocol::response::{ComputeResponse, PeekResponse, SubscribeResponse};
 use crate::service::{ComputeClient, ComputeGrpcClient};
 use crate::types::dataflows::DataflowDescription;
@@ -155,7 +155,7 @@ pub enum ComputeControllerResponse<T> {
     /// A notification that new resource usage metrics are available for a given replica.
     ReplicaMetrics(ReplicaId, Vec<ServiceProcessMetrics>),
     /// A notification that the write frontiers of the replicas have changed.
-    ReplicaWriteFrontiers(HashMap<ReplicaId, Vec<(GlobalId, T)>>),
+    ReplicaWriteFrontiers(BTreeMap<ReplicaId, Vec<(GlobalId, T)>>),
 }
 
 /// Replica configuration
@@ -281,6 +281,8 @@ pub struct ComputeController<T> {
     orchestrator: ComputeOrchestrator,
     /// Set to `true` once `initialization_complete` has been called.
     initialized: bool,
+    /// Compute configuration to apply to new instances.
+    config: ComputeParameters,
     /// A response to handle on the next call to `ActiveComputeController::process`.
     stashed_response: Option<(ComputeInstanceId, ReplicaId, ComputeResponse<T>)>,
     /// Times we have last received responses from replicas.
@@ -315,6 +317,7 @@ impl<T> ComputeController<T> {
                 init_container_image,
             ),
             initialized: false,
+            config: Default::default(),
             stashed_response: None,
             replica_heartbeats: BTreeMap::new(),
             replica_metrics: BTreeMap::new(),
@@ -414,7 +417,6 @@ where
         &mut self,
         id: ComputeInstanceId,
         arranged_logs: BTreeMap<LogVariant, GlobalId>,
-        max_result_size: u32,
     ) -> Result<(), InstanceExists> {
         if self.instances.contains_key(&id) {
             return Err(InstanceExists(id));
@@ -426,18 +428,18 @@ where
                 id,
                 self.build_info,
                 arranged_logs,
-                max_result_size,
                 self.orchestrator.clone(),
                 self.envd_epoch,
             ),
         );
 
+        let instance = self.instances.get_mut(&id).expect("instance just added");
         if self.initialized {
-            self.instances
-                .get_mut(&id)
-                .expect("instance just added")
-                .initialization_complete();
+            instance.initialization_complete();
         }
+
+        let config_params = self.config.clone();
+        instance.update_configuration(config_params);
 
         Ok(())
     }
@@ -451,6 +453,15 @@ where
         if let Some(compute_state) = self.instances.remove(&id) {
             compute_state.drop();
         }
+    }
+
+    /// Update compute configuration.
+    pub fn update_configuration(&mut self, config_params: ComputeParameters) {
+        for instance in self.instances.values_mut() {
+            instance.update_configuration(config_params.clone());
+        }
+
+        self.config.update(config_params);
     }
 
     /// Mark the end of any initialization commands.
@@ -713,17 +724,6 @@ where
         Ok(())
     }
 
-    /// Update the max size in bytes of any result.
-    pub fn update_max_result_size(
-        &mut self,
-        instance_id: ComputeInstanceId,
-        max_result_size: u32,
-    ) -> Result<(), InstanceMissing> {
-        self.instance(instance_id)?
-            .update_max_result_size(max_result_size);
-        Ok(())
-    }
-
     /// Processes the work queued by [`ComputeController::ready`].
     pub fn process(&mut self) -> Option<ComputeControllerResponse<T>> {
         // Rehydrate any failed replicas.
@@ -768,8 +768,9 @@ where
         // Process pending stats updates
         if self.compute.stats_update_pending {
             self.compute.stats_update_pending = false;
-            let r = self
-                .compute
+
+            let mut replica_frontiers = BTreeMap::new();
+            self.compute
                 .instances
                 .values()
                 .flat_map(|inst| inst.collections_iter())
@@ -783,9 +784,15 @@ where
                                 .map(|x| (*replica_id, (*coll_id, x.clone())))
                         })
                 })
-                // iterator over (replica_id, (collection_id, write_frontier)) tuples
-                .into_group_map();
-            Some(ComputeControllerResponse::ReplicaWriteFrontiers(r))
+                .for_each(|(replica_id, frontier)| {
+                    replica_frontiers
+                        .entry(replica_id)
+                        .or_insert_with(Vec::new)
+                        .push(frontier)
+                });
+            Some(ComputeControllerResponse::ReplicaWriteFrontiers(
+                replica_frontiers,
+            ))
         } else {
             None
         }

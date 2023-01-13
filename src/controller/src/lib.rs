@@ -88,7 +88,7 @@
 //! Consult the `StorageController` and `ComputeController` documentation for more information
 //! about each of these interfaces.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::mem;
 use std::num::NonZeroI64;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ use mz_persist_client::PersistLocation;
 use mz_persist_types::Codec64;
 use mz_proto::RustType;
 use mz_repr::{GlobalId, TimestampManipulation};
-use mz_stash::PostgresFactory;
+use mz_stash::StashFactory;
 use mz_storage_client::client::{
     ProtoStorageCommand, ProtoStorageResponse, StorageCommand, StorageResponse,
 };
@@ -143,7 +143,7 @@ pub struct ControllerConfig {
     /// The now function to advance the controller's introspection collections.
     pub now: NowFn,
     /// The postgres stash factory.
-    pub postgres_factory: PostgresFactory,
+    pub postgres_factory: StashFactory,
 }
 
 /// Responses that [`Controller`] can produce.
@@ -163,7 +163,7 @@ pub enum ControllerResponse<T = mz_repr::Timestamp> {
     /// Notification that new resource usage metrics are available for a given replica.
     ComputeReplicaMetrics(ReplicaId, Vec<ServiceProcessMetrics>),
     /// Notification that the write frontiers of the replicas have changed.
-    ComputeReplicaWriteFrontiers(HashMap<ReplicaId, Vec<(GlobalId, T)>>),
+    ComputeReplicaWriteFrontiers(BTreeMap<ReplicaId, Vec<(GlobalId, T)>>),
 }
 
 impl<T> From<ComputeControllerResponse<T>> for ControllerResponse<T> {

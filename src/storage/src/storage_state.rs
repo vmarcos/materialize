@@ -277,6 +277,12 @@ impl<'w, A: Allocate> Worker<'w, A> {
     pub fn handle_storage_command(&mut self, cmd: StorageCommand) {
         match cmd {
             StorageCommand::InitializationComplete => (),
+            StorageCommand::UpdateConfiguration(params) => {
+                tracing::info!("Applying configuration update: {params:?}");
+
+                // TODO(#16753): apply config to `self.storage_state.persist_clients`
+                let _ = params.persist;
+            }
             StorageCommand::CreateSources(ingestions) => {
                 for ingestion in ingestions {
                     // Remember the ingestion description to facilitate possible
@@ -286,12 +292,15 @@ impl<'w, A: Allocate> Worker<'w, A> {
                         .insert(ingestion.id, ingestion.description.clone());
 
                     // Initialize shared frontier tracking.
-                    for export_id in ingestion.description.source_exports.keys() {
+                    for (export_id, export) in ingestion.description.source_exports.iter() {
                         self.storage_state.source_statistics.insert(
                             *export_id,
                             SourceStatistics::new(
                                 *export_id,
                                 self.storage_state.timely_worker_index,
+                                &self.storage_state.source_metrics,
+                                ingestion.id,
+                                &export.storage_metadata.data_shard,
                             ),
                         );
 
@@ -527,7 +536,9 @@ impl<'w, A: Allocate> Worker<'w, A> {
                         }
                     })
                 }
-                StorageCommand::AllowCompaction(_) | StorageCommand::InitializationComplete => (),
+                StorageCommand::InitializationComplete
+                | StorageCommand::UpdateConfiguration(_)
+                | StorageCommand::AllowCompaction(_) => (),
             }
         }
 
