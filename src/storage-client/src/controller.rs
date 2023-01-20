@@ -39,7 +39,7 @@ use timely::order::{PartialOrder, TotalOrder};
 use timely::progress::frontier::{AntichainRef, MutableAntichain};
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
 use tokio::sync::Mutex;
-use tokio_stream::{StreamExt, StreamMap};
+use tokio_stream::StreamMap;
 use tracing::{debug, info};
 
 use mz_build_info::BuildInfo;
@@ -55,24 +55,23 @@ use mz_stash::{self, StashError, StashFactory, TypedCollection};
 
 use crate::client::{
     CreateSinkCommand, CreateSourceCommand, ProtoStorageCommand, ProtoStorageResponse,
-    SourceStatisticsUpdate, StorageCommand, StorageResponse, Update,
+    SinkStatisticsUpdate, SourceStatisticsUpdate, StorageCommand, StorageResponse, Update,
 };
-use crate::controller::hosts::{StorageHosts, StorageHostsConfig};
+use crate::controller::clusters::{StorageClusters, StorageClustersConfig};
 use crate::healthcheck;
+use crate::types::clusters::StorageClusterConfig;
 use crate::types::errors::DataflowError;
-use crate::types::hosts::StorageHostConfig;
 use crate::types::parameters::StorageParameters;
 use crate::types::sinks::{
     MetadataUnfilled, ProtoDurableExportMetadata, SinkAsOf, StorageSinkDesc,
 };
-use crate::types::sources::{IngestionDescription, MzOffset, SourceData, SourceExport};
+use crate::types::sources::{IngestionDescription, SourceData, SourceExport};
 
+mod clusters;
 mod collection_mgmt;
-mod hosts;
 mod metrics_scraper;
 mod persist_handles;
 mod rehydration;
-mod remap_migration;
 mod statistics;
 
 include!(concat!(env!("OUT_DIR"), "/mz_storage_client.controller.rs"));
@@ -109,11 +108,12 @@ pub enum IntrospectionType {
     SinkStatusHistory,
     SourceStatusHistory,
     ShardMapping,
-    StorageHostMetrics,
+    StorageClusterMetrics,
 
     // Note that this single-shard introspection source will be changed to per-replica,
     // once we allow multiplexing multiple sources/sinks on a single cluster.
     StorageSourceStatistics,
+    StorageSinkStatistics,
 }
 
 /// Describes how data is written to the collection.
@@ -160,7 +160,7 @@ pub struct ExportDescription<T = mz_repr::Timestamp> {
     pub sink: StorageSinkDesc<MetadataUnfilled, T>,
     /// The address of a `clusterd` process on which to install the sink or the
     /// settings for spinning up a controller-managed process.
-    pub host_config: StorageHostConfig,
+    pub cluster_config: StorageClusterConfig,
 }
 
 /// Opaque token to ensure `prepare_export` is called before `create_exports`.  This token proves
@@ -170,6 +170,13 @@ pub struct ExportDescription<T = mz_repr::Timestamp> {
 pub struct CreateExportToken {
     id: GlobalId,
     from_id: GlobalId,
+}
+
+impl CreateExportToken {
+    /// Returns the ID of the export with which the token is associated.
+    pub fn id(&self) -> GlobalId {
+        self.id
+    }
 }
 
 #[async_trait(?Send)]
@@ -209,6 +216,10 @@ pub trait StorageController: Debug + Send {
     /// now valid to use in queries at times beyond the initial `since` frontiers. Each
     /// collection also acquires a read capability at this frontier, which will need to
     /// be repeatedly downgraded with `allow_compaction()` to permit compaction.
+    ///
+    /// This method is NOT idempotent; It can fail between processing of different
+    /// collections and leave the controller in an inconsistent state. It is almost
+    /// always wrong to do anything but abort the process on `Err`.
     async fn create_collections(
         &mut self,
         collections: Vec<(GlobalId, CollectionDescription<Self::Timestamp>)>,
@@ -216,7 +227,7 @@ pub trait StorageController: Debug + Send {
 
     async fn alter_collections(
         &mut self,
-        collections: Vec<(GlobalId, StorageHostConfig)>,
+        collections: Vec<(GlobalId, StorageClusterConfig)>,
     ) -> Result<(), StorageError>;
 
     /// Acquire an immutable reference to the export state, should it exist.
@@ -287,7 +298,7 @@ pub trait StorageController: Debug + Send {
 
     /// Returns the snapshot of the contents of the local input named `id` at `as_of`.
     async fn snapshot(
-        &mut self,
+        &self,
         id: GlobalId,
         as_of: Self::Timestamp,
     ) -> Result<Vec<(Row, Diff)>, StorageError>;
@@ -422,16 +433,18 @@ impl<T: Timestamp> ReadPolicy<T> {
 }
 
 /// Metadata required by a storage instance to read a storage collection
-#[derive(Arbitrary, Clone, Debug, PartialEq, PartialOrd, Ord, Eq, Serialize, Deserialize)]
+#[derive(Arbitrary, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionMetadata {
-    /// The persist location where the shards are located
+    /// The persist location where the shards are located.
     pub persist_location: PersistLocation,
-    /// The persist shard id of the remap collection used to reclock this collection
+    /// The persist shard id of the remap collection used to reclock this collection.
     pub remap_shard: ShardId,
-    /// The persist shard containing the contents of this storage collection
+    /// The persist shard containing the contents of this storage collection.
     pub data_shard: ShardId,
-    /// The persist shard containing the status updates for this storage collection
+    /// The persist shard containing the status updates for this storage collection.
     pub status_shard: Option<ShardId>,
+    /// The `RelationDesc` that describes the contents of the `data_shard`.
+    pub relation_desc: RelationDesc,
 }
 
 impl RustType<ProtoCollectionMetadata> for CollectionMetadata {
@@ -442,6 +455,7 @@ impl RustType<ProtoCollectionMetadata> for CollectionMetadata {
             data_shard: self.data_shard.to_string(),
             remap_shard: self.remap_shard.to_string(),
             status_shard: self.status_shard.map(|s| s.to_string()),
+            relation_desc: Some(self.relation_desc.into_proto()),
         }
     }
 
@@ -463,6 +477,9 @@ impl RustType<ProtoCollectionMetadata> for CollectionMetadata {
                 .status_shard
                 .map(|s| s.parse().map_err(TryFromProtoError::InvalidShardId))
                 .transpose()?,
+            relation_desc: value
+                .relation_desc
+                .into_rust_if_some("ProtoCollectionMetadata::relation_desc")?,
         })
     }
 }
@@ -597,9 +614,9 @@ pub struct StorageControllerState<T: Timestamp + Lattice + Codec64 + TimestampMa
     /// without blocking the storage controller.
     persist_read_handles: persist_handles::PersistReadWorker<T>,
     stashed_response: Option<StorageResponse<T>>,
-    /// Storage hosts that should be deprovisioned during the next call to `StorageController::process`,
+    /// Storage clusters that should be deprovisioned during the next call to `StorageController::process`,
     /// along with the status collection to report the drop to.
-    pending_host_deprovisions: BTreeSet<(GlobalId, GlobalId)>,
+    pending_cluster_deprovisions: BTreeSet<(GlobalId, GlobalId)>,
     /// Commands that should be send to storage instances during the next call
     /// to `StorageController::process`.
     pending_compaction_commands: Vec<(GlobalId, Antichain<T>)>,
@@ -621,6 +638,9 @@ pub struct StorageControllerState<T: Timestamp + Lattice + Codec64 + TimestampMa
     /// and its contents are entirely driven by `StorageResponse::StatisticsUpdates`'s.
     source_statistics:
         Arc<std::sync::Mutex<HashMap<GlobalId, HashMap<usize, SourceStatisticsUpdate>>>>,
+    /// Consolidated metrics updates to periodically write. We do not eagerly initialize this,
+    /// and its contents are entirely driven by `StorageResponse::StatisticsUpdates`'s.
+    sink_statistics: Arc<std::sync::Mutex<HashMap<GlobalId, HashMap<usize, SinkStatisticsUpdate>>>>,
 }
 
 /// A storage controller for a storage instance.
@@ -628,8 +648,8 @@ pub struct StorageControllerState<T: Timestamp + Lattice + Codec64 + TimestampMa
 pub struct Controller<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + TimestampManipulation>
 {
     state: StorageControllerState<T>,
-    /// Storage host provisioning and storage object assignment.
-    hosts: StorageHosts<T>,
+    /// Storage cluster provisioning and storage object assignment.
+    clusters: StorageClusters<T>,
     /// Mechanism for returning frontier advancement for tables.
     internal_response_queue: tokio::sync::mpsc::UnboundedReceiver<StorageResponse<T>>,
     /// The persist location where all storage collections are being written to
@@ -758,7 +778,7 @@ impl<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + TimestampManipulatio
             persist_write_handles,
             persist_read_handles: persist_handles::PersistReadWorker::new(),
             stashed_response: None,
-            pending_host_deprovisions: BTreeSet::new(),
+            pending_cluster_deprovisions: BTreeSet::new(),
             pending_compaction_commands: Vec::new(),
             collection_manager,
             introspection_ids: HashMap::new(),
@@ -766,6 +786,7 @@ impl<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + TimestampManipulatio
             now,
             envd_epoch,
             source_statistics: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sink_statistics: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -782,13 +803,13 @@ where
     type Timestamp = T;
 
     fn initialization_complete(&mut self) {
-        self.hosts.initialization_complete();
+        self.clusters.initialization_complete();
     }
 
     fn update_configuration(&mut self, config_params: StorageParameters) {
         // TODO(#16753): apply config to `self.persist`
 
-        self.hosts.update_configuration(config_params);
+        self.clusters.update_configuration(config_params);
     }
 
     fn collection(&self, id: GlobalId) -> Result<&CollectionState<Self::Timestamp>, StorageError> {
@@ -839,6 +860,9 @@ where
         }
 
         // Install collection state for each bound description.
+        // Note that this method implementation attempts to do AS MUCH work
+        // concurrently as possible. There are inline comments explaining the motivation
+        // behind each section
 
         // Perform all stash writes in a single transaction, to minimize transaction overhead and
         // the time spent waiting for stash.
@@ -859,7 +883,9 @@ where
 
         let mut durable_metadata = METADATA_COLLECTION.peek_one(&mut self.state.stash).await?;
 
-        for (id, description) in collections {
+        // We first enrich each collection description with some additional metadata...
+        use futures::stream::{StreamExt, TryStreamExt};
+        let enriched_with_metdata = collections.into_iter().map(|(id, description)| {
             let collection_shards = durable_metadata.remove(&id).expect("inserted above");
             let status_shard = if let Some(status_collection_id) = description.status_collection_id
             {
@@ -878,89 +904,137 @@ where
                 remap_shard: collection_shards.remap_shard,
                 data_shard: collection_shards.data_shard,
                 status_shard,
+                relation_desc: description.desc.clone(),
             };
 
-            // should be replaced with real introspection (https://github.com/MaterializeInc/materialize/issues/14266)
-            // but for now, it's helpful to have this mapping written down somewhere
-            debug!(
-                "mapping GlobalId={} to remap shard ({}), data shard ({}), status shard ({:?})",
-                id, metadata.remap_shard, metadata.data_shard, status_shard
-            );
+            Ok((id, description, metadata))
+        });
 
-            let persist_client = self
-                .persist
-                .lock()
-                .await
-                .open(self.persist_location.clone())
-                .await
-                .unwrap();
+        // So that we can open `SinceHandle`s for each collections concurrently.
+        let persist_client = self
+            .persist
+            .lock()
+            .await
+            .open(self.persist_location.clone())
+            .await
+            .unwrap();
+        let persist_client = &persist_client;
+        // Reborrow the `&mut self` as immutable, as all the concurrent work to be processed in
+        // this stream cannot all have exclusive access.
+        let this = &*self;
+        let to_register: Vec<_> = futures::stream::iter(enriched_with_metdata)
+            .map(|data: Result<_, anyhow::Error>| async move {
+                let (id, description, metadata) = data?;
 
-            let purpose = format!("controller data {}", id);
-            let write = persist_client
-                .open_writer(metadata.data_shard, &purpose)
-                .await
-                .expect("invalid persist usage");
+                // should be replaced with real introspection (https://github.com/MaterializeInc/materialize/issues/14266)
+                // but for now, it's helpful to have this mapping written down somewhere
+                debug!(
+                    "mapping GlobalId={} to remap shard ({}), data shard ({}), status shard ({:?})",
+                    id, metadata.remap_shard, metadata.data_shard, metadata.status_shard
+                );
 
-            // Construct the handle in a separate block to ensure all error paths are diverging
-            let since_handle = {
-                let mut handle: SinceHandle<_, _, _, _, PersistEpoch> = persist_client
-                    .open_critical_since(
+                let purpose = format!("controller data {}", id);
+                let write = persist_client
+                    .open_writer(
                         metadata.data_shard,
-                        PersistClient::CONTROLLER_CRITICAL_SINCE,
                         &purpose,
+                        metadata.relation_desc.clone(),
                     )
                     .await
                     .expect("invalid persist usage");
 
-                let since = description
-                    .since
-                    .clone()
-                    .unwrap_or_else(|| handle.since().clone());
+                // Construct the handle in a separate block to ensure all error paths are diverging
+                let since_handle = {
+                    let mut handle: SinceHandle<_, _, _, _, PersistEpoch> = persist_client
+                        .open_critical_since(
+                            metadata.data_shard,
+                            PersistClient::CONTROLLER_CRITICAL_SINCE,
+                            &purpose,
+                        )
+                        .await
+                        .expect("invalid persist usage");
 
-                // We should only continue if we can fence out any other processes
-                let our_epoch = self.state.envd_epoch;
-                loop {
-                    let their_epoch: PersistEpoch = handle.opaque().clone();
+                    let since = description
+                        .since
+                        .clone()
+                        .unwrap_or_else(|| handle.since().clone());
 
-                    let should_exchange = their_epoch.0.map(|e| e < our_epoch).unwrap_or(true);
-                    if should_exchange {
-                        let fenced_others = handle
-                            .compare_and_downgrade_since(
-                                &their_epoch,
-                                (&PersistEpoch::from(our_epoch), &since),
-                            )
-                            .await
-                            .is_ok();
-                        if fenced_others {
-                            break handle;
+                    // We should only continue if we can fence out any other processes
+                    let our_epoch = this.state.envd_epoch;
+                    loop {
+                        let their_epoch: PersistEpoch = handle.opaque().clone();
+
+                        let should_exchange = their_epoch.0.map(|e| e < our_epoch).unwrap_or(true);
+                        if should_exchange {
+                            let fenced_others = handle
+                                .compare_and_downgrade_since(
+                                    &their_epoch,
+                                    (&PersistEpoch::from(our_epoch), &since),
+                                )
+                                .await
+                                .is_ok();
+                            if fenced_others {
+                                break handle;
+                            }
+                        } else {
+                            mz_ore::halt!("fenced by envd @ {their_epoch:?}. ours = {our_epoch}");
                         }
-                    } else {
-                        mz_ore::halt!("fenced by envd @ {their_epoch:?}. ours = {our_epoch}");
                     }
-                }
-            };
+                };
 
-            let collection_state = CollectionState::new(
-                description.clone(),
-                since_handle.since().clone(),
-                write.upper().clone(),
-                metadata.clone(),
-            );
+                let cs = CollectionState::new(
+                    description.clone(),
+                    since_handle.since().clone(),
+                    write.upper().clone(),
+                    metadata.clone(),
+                );
+                Ok::<_, anyhow::Error>((id, description, write, since_handle, cs))
+            })
+            // Poll each future for each collection concurrently, maximum of 50 at a time.
+            .buffer_unordered(50)
+            // HERE BE DRAGONS:
+            //
+            // There are at least 2 subtleties in using `FuturesUnordered` (which
+            // `buffer_unordered` uses underneath:
+            // - One is captured here <https://github.com/rust-lang/futures-rs/issues/2387>
+            // - And the other is deadlocking if processing an OUTPUT of a `FuturesUnordered`
+            // stream attempts to obtain an async mutex that is also obtained in the futures
+            // being polled.
+            //
+            // Both of these could potentially be issues in all usages of `buffer_unordered` in
+            // this method, so we stick the standard advice: only use `try_collect` or
+            // `collect`!
+            .try_collect()
+            .await?;
 
+        let mut to_create = Vec::with_capacity(to_register.len());
+        // This work mutates the controller state, so must be done serially. Because there
+        // is no io-bound work, its very fast.
+        for (id, description, write, since_handle, collection_state) in to_register {
             self.state.persist_write_handles.register(id, write);
             self.state.persist_read_handles.register(id, since_handle);
 
             self.state.collections.insert(id, collection_state);
 
-            self.migrate_remap_shard(id, &description.data_source).await;
+            to_create.push((id, description));
+        }
 
-            self.register_shard_mapping(id).await;
+        // Reborrow `&mut self` immutably, same reasoning as above.
+        let this = &*self;
 
+        this.register_shard_mappings(to_create.iter().map(|(id, _)| *id))
+            .await;
+
+        // TODO(guswynn): perform the io in this final section concurrently.
+        for (id, description) in to_create {
             match description.data_source {
                 DataSource::Ingestion(ingestion) => {
                     // Each ingestion is augmented with the collection metadata.
                     let mut source_imports = BTreeMap::new();
                     for (id, _) in ingestion.source_imports {
+                        // This _requires_ that the sub-source collection (with
+                        // `DataSource::Other`) was registered BEFORE we process this, the
+                        // top-level collection.
                         let metadata = self.collection(id)?.collection_metadata.clone();
                         source_imports.insert(id, metadata);
                     }
@@ -971,6 +1045,8 @@ where
 
                     let mut source_exports = BTreeMap::new();
                     for (id, export) in ingestion.source_exports {
+                        // Note that these metadata's have been previously enriched with the
+                        // required `RelationDesc` for each sub-source above!
                         let storage_metadata = self.collection(id)?.collection_metadata.clone();
                         source_exports.insert(
                             id,
@@ -987,14 +1063,17 @@ where
                         ingestion_metadata,
                         // The rest of the fields are identical
                         desc: ingestion.desc,
-                        host_config: ingestion.host_config,
+                        cluster_config: ingestion.cluster_config,
                     };
                     let mut persist_clients = self.persist.lock().await;
                     let mut state = desc.initialize_state(&mut persist_clients).await;
                     let resume_upper = desc.calculate_resumption_frontier(&mut state).await;
 
-                    // Provision a storage host for the ingestion.
-                    let client = self.hosts.provision(id, desc.host_config.clone()).await?;
+                    // Provision a storage cluster for the ingestion.
+                    let client = self
+                        .clusters
+                        .provision(id, desc.cluster_config.clone())
+                        .await?;
                     let augmented_ingestion = CreateSourceCommand {
                         id,
                         description: desc,
@@ -1016,7 +1095,7 @@ where
                         IntrospectionType::ShardMapping => {
                             self.initialize_shard_mapping().await;
                         }
-                        IntrospectionType::StorageHostMetrics => {
+                        IntrospectionType::StorageClusterMetrics => {
                             // This has some subtlety, points from guswynn:
                             //
                             //   - This takes the collection to empty, at roughly
@@ -1039,7 +1118,7 @@ where
                             // output collection.
                             self.reconcile_managed_collection(id, vec![]).await;
 
-                            let metrics_fetcher = self.hosts.metrics_fetcher();
+                            let metrics_fetcher = self.clusters.metrics_fetcher();
                             let scraper_token = metrics_scraper::spawn_metrics_scraper(
                                 id.clone(),
                                 metrics_fetcher,
@@ -1066,6 +1145,21 @@ where
                             // dropped, so that the internal task will stop.
                             self.state.introspection_tokens.insert(id, scraper_token);
                         }
+                        IntrospectionType::StorageSinkStatistics => {
+                            // Set the collection to empty.
+                            self.reconcile_managed_collection(id, vec![]).await;
+
+                            let scraper_token = statistics::spawn_statistics_scraper(
+                                id.clone(),
+                                // These do a shallow copy.
+                                self.state.collection_manager.clone(),
+                                Arc::clone(&self.state.sink_statistics),
+                            );
+
+                            // Make sure this is dropped when the controller is
+                            // dropped, so that the internal task will stop.
+                            self.state.introspection_tokens.insert(id, scraper_token);
+                        }
                         IntrospectionType::SourceStatusHistory
                         | IntrospectionType::SinkStatusHistory => {
                             // nothing to do: these collections are append only
@@ -1081,10 +1175,10 @@ where
 
     async fn alter_collections(
         &mut self,
-        collections: Vec<(GlobalId, StorageHostConfig)>,
+        collections: Vec<(GlobalId, StorageClusterConfig)>,
     ) -> Result<(), StorageError> {
         for (id, config) in collections {
-            let _ = self.hosts.provision(id, config).await?;
+            let _ = self.clusters.provision(id, config).await?;
         }
         Ok(())
     }
@@ -1211,8 +1305,11 @@ where
                 },
             };
 
-            // Provision a storage host for the ingestion.
-            let client = self.hosts.provision(id, description.host_config).await?;
+            // Provision a storage cluster for the ingestion.
+            let client = self
+                .clusters
+                .provision(id, description.cluster_config)
+                .await?;
 
             client.send(StorageCommand::CreateSinks(vec![cmd]));
         }
@@ -1258,7 +1355,9 @@ where
             // Remove sink by removing its write frontier and arranging for deprovisioning.
             self.update_write_frontiers(&[(id, Antichain::new())]);
             let status_id = self.state.introspection_ids[&IntrospectionType::SinkStatusHistory];
-            self.state.pending_host_deprovisions.insert((id, status_id));
+            self.state
+                .pending_cluster_deprovisions
+                .insert((id, status_id));
         }
     }
 
@@ -1285,7 +1384,7 @@ where
     // actually existed. We should include the original time in the updates advanced by the as_of
     // frontier in the result and let the caller decide what to do with the information.
     async fn snapshot(
-        &mut self,
+        &self,
         id: GlobalId,
         as_of: Self::Timestamp,
     ) -> Result<Vec<(Row, Diff)>, StorageError> {
@@ -1304,9 +1403,10 @@ where
         // heartbeat continously. The assumption is that calls to snapshot are rare and therefore
         // worth it to always create a new handle.
         let mut read_handle = persist_client
-            .open_leased_reader::<SourceData, (), _, _>(
+            .open_leased_reader::<SourceData, (), _, _, _>(
                 metadata.data_shard,
                 &format!("snapshot {}", id),
+                metadata.relation_desc.clone(),
             )
             .await
             .expect("invalid persist usage");
@@ -1438,12 +1538,13 @@ where
 
     async fn ready(&mut self) {
         let mut clients = self
-            .hosts
+            .clusters
             .clients()
             .map(|client| client.response_stream())
             .enumerate()
             .collect::<StreamMap<_, _>>();
 
+        use tokio_stream::StreamExt;
         let msg = tokio::select! {
             // Order matters here. We want to process internal commands
             // before processing external commands.
@@ -1466,11 +1567,19 @@ where
                 // TODO(petrosagg): It looks like the storage controller never cleans up GlobalIds
                 // from its state. It should probably be done as a reaction to this response.
             }
-            Some(StorageResponse::StatisticsUpdates(source_stats)) => {
-                // Note we only hold the lock while moving some plain-old-data around here.
-                let mut shared_stats = self.state.source_statistics.lock().expect("poisoned");
+            Some(StorageResponse::StatisticsUpdates(source_stats, sink_stats)) => {
+                // Note we only hold the locks while moving some plain-old-data around here.
 
+                let mut shared_stats = self.state.source_statistics.lock().expect("poisoned");
                 for stat in source_stats {
+                    let shared_stats = shared_stats.entry(stat.id).or_default();
+                    // We just write the whole object, as the update from storage represents the
+                    // current values.
+                    shared_stats.insert(stat.worker_id, stat);
+                }
+
+                let mut shared_stats = self.state.sink_statistics.lock().expect("poisoned");
+                for stat in sink_stats {
                     let shared_stats = shared_stats.entry(stat.id).or_default();
                     // We just write the whole object, as the update from storage represents the
                     // current values.
@@ -1483,7 +1592,7 @@ where
         // instances, but this seems fine for now.
         for (id, frontier) in self.state.pending_compaction_commands.drain(..) {
             // TODO(petrosagg): make this a strict check
-            if let Some(client) = self.hosts.client(id) {
+            if let Some(client) = self.clusters.client(id) {
                 client.send(StorageCommand::AllowCompaction(vec![(
                     id,
                     frontier.clone(),
@@ -1492,26 +1601,28 @@ where
                 if frontier.is_empty() {
                     let status_id =
                         self.state.introspection_ids[&IntrospectionType::SourceStatusHistory];
-                    self.state.pending_host_deprovisions.insert((id, status_id));
+                    self.state
+                        .pending_cluster_deprovisions
+                        .insert((id, status_id));
                 }
             }
         }
 
-        let to_deprovision = std::mem::take(&mut self.state.pending_host_deprovisions);
+        let to_deprovision = std::mem::take(&mut self.state.pending_cluster_deprovisions);
         for (id, status_id) in to_deprovision {
             // Record the destruction of the source
             let status_row = healthcheck::pack_status_row(id, "dropped", None, (self.state.now)());
             self.append_to_managed_collection(status_id, vec![(status_row, 1)])
                 .await;
 
-            self.hosts.deprovision(id).await?;
+            self.clusters.deprovision(id).await?;
         }
 
         Ok(())
     }
 
     async fn remove_orphans(&mut self, next_id: GlobalId) -> Result<(), anyhow::Error> {
-        self.hosts.remove_orphans(next_id).await
+        self.clusters.remove_orphans(next_id).await
     }
 }
 
@@ -1572,8 +1683,8 @@ where
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let hosts = StorageHosts::new(
-            StorageHostsConfig {
+        let clusters = StorageClusters::new(
+            StorageClustersConfig {
                 build_info,
                 orchestrator,
                 clusterd_image,
@@ -1585,7 +1696,7 @@ where
         Self {
             state: StorageControllerState::new(postgres_url, tx, now, postgres_factory, envd_epoch)
                 .await,
-            hosts,
+            clusters,
             internal_response_queue: rx,
             persist_location,
             persist: persist_clients,
@@ -1677,7 +1788,7 @@ where
     /// # Panics
     /// - If `id` does not belong to a collection or is not registered as a
     ///   managed collection.
-    async fn reconcile_managed_collection(&mut self, id: GlobalId, updates: Vec<(Row, Diff)>) {
+    async fn reconcile_managed_collection(&self, id: GlobalId, updates: Vec<(Row, Diff)>) {
         let mut reconciled_updates = HashMap::<Row, Diff>::with_capacity(updates.len());
 
         for (row, diff) in updates.into_iter() {
@@ -1719,7 +1830,7 @@ where
     ///
     /// # Panics
     /// - If `id` is not registered as a managed collection.
-    async fn append_to_managed_collection(&mut self, id: GlobalId, updates: Vec<(Row, Diff)>) {
+    async fn append_to_managed_collection(&self, id: GlobalId, updates: Vec<(Row, Diff)>) {
         self.state
             .collection_manager
             .append_to_collection(id, updates)
@@ -1768,7 +1879,10 @@ where
     /// - If `self.state.collections` does not have an entry for `global_id`.
     /// - If `IntrospectionType::ShardMapping`'s `GlobalId` is not registered as
     ///   a managed collection.
-    async fn register_shard_mapping(&mut self, global_id: GlobalId) {
+    async fn register_shard_mappings<I>(&self, global_ids: I)
+    where
+        I: Iterator<Item = GlobalId>,
+    {
         let id = match self
             .state
             .introspection_ids
@@ -1778,16 +1892,20 @@ where
             _ => return,
         };
 
-        let shard_id = self.state.collections[&global_id]
-            .collection_metadata
-            .data_shard;
-
+        let mut updates = vec![];
         // Pack updates into rows
         let mut row_buf = Row::default();
-        let mut packer = row_buf.packer();
-        packer.push(Datum::from(global_id.to_string().as_str()));
-        packer.push(Datum::from(shard_id.to_string().as_str()));
-        let updates = vec![(row_buf.clone(), 1)];
+
+        for global_id in global_ids {
+            let shard_id = self.state.collections[&global_id]
+                .collection_metadata
+                .data_shard;
+
+            let mut packer = row_buf.packer();
+            packer.push(Datum::from(global_id.to_string().as_str()));
+            packer.push(Datum::from(shard_id.to_string().as_str()));
+            updates.push((row_buf.clone(), 1));
+        }
 
         self.append_to_managed_collection(id, updates).await;
     }
@@ -1797,7 +1915,7 @@ where
     ///
     /// Any shards changed between the old and the new version will be
     /// decommissioned/eventually deleted.
-    async fn rewrite_collection_metadata(
+    async fn _rewrite_collection_metadata(
         &mut self,
         id: GlobalId,
         new_metadata: DurableCollectionMetadata,
@@ -1862,6 +1980,7 @@ where
         metadata.collection_metadata.remap_shard = remap_shard;
     }
 
+    #[allow(dead_code)]
     async fn truncate_shards(&mut self, shards: &[(ShardId, String)]) {
         // Open a persist client to delete unused shards.
         let persist_client = self
@@ -1874,9 +1993,12 @@ where
 
         for (shard_id, shard_purpose) in shards {
             let (mut write, mut read) = persist_client
-                .open::<crate::types::sources::SourceData, (), T, Diff>(
+                .open::<crate::types::sources::SourceData, (), T, Diff, _>(
                     *shard_id,
                     shard_purpose.as_str(),
+                    // We have to _read_ the shard to figure out if its been migrated or not, so we
+                    // hedge on setting a `RelationDesc`.
+                    PersistClient::TO_REPLACE_SCHEMA,
                 )
                 .await
                 .expect("invalid persist usage");
@@ -1897,72 +2019,6 @@ where
                 shard_id
             );
         }
-    }
-
-    /// For appropriate data sources, migrate the remap collection correlated
-    /// to `id` to one compatible with `Partitioned<PartitionId, MzOffset>`.
-    pub async fn migrate_remap_shard(&mut self, id: GlobalId, data_source: &DataSource) {
-        // We only want to migrate ingestion-based sources' remap collections
-        let connection = match data_source {
-            DataSource::Ingestion(IngestionDescription {
-                desc: crate::types::sources::SourceDesc { connection, .. },
-                ..
-            }) => connection,
-            _ => return,
-        };
-
-        let metadata = self
-            .state
-            .collections
-            .get(&id)
-            .expect("must have seen metadata inserted")
-            .collection_metadata
-            .clone();
-
-        let migrate_to_shard = ShardId::new();
-
-        let res = match connection {
-            crate::types::sources::GenericSourceConnection::Kafka(_) => {
-                remap_migration::RemapHandleMigrator::<
-                    mz_timely_util::order::Partitioned<i32, MzOffset>,
-                    T,
-                >::migrate(
-                    Arc::clone(&self.persist),
-                    metadata.clone(),
-                    migrate_to_shard,
-                    id,
-                )
-                .await
-            }
-            _ => {
-                remap_migration::RemapHandleMigrator::<MzOffset, T>::migrate(
-                    Arc::clone(&self.persist),
-                    metadata.clone(),
-                    migrate_to_shard,
-                    id,
-                )
-                .await
-            }
-        };
-
-        let remap_shard = match res {
-            None => {
-                info!("remap shard migration({id:?}): unnecessary");
-                return;
-            }
-            Some(s) => s,
-        };
-
-        self.rewrite_collection_metadata(
-            id,
-            DurableCollectionMetadata {
-                data_shard: metadata.data_shard,
-                remap_shard,
-            },
-        )
-        .await;
-
-        info!("remap shard migration({id:?}): complete");
     }
 }
 

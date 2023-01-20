@@ -19,6 +19,7 @@ from semver import Version
 from materialize import util
 from materialize.mzcompose import Composition, WorkflowArgumentParser
 from materialize.mzcompose.services import (
+    Cockroach,
     Kafka,
     Materialized,
     Postgres,
@@ -49,9 +50,11 @@ SERVICES = [
         ],
     ),
     Postgres(),
+    Cockroach(setup_materialize=True),
     Materialized(
         options=list(mz_options.values()),
         volumes_extra=["secrets:/share/secrets"],
+        external_cockroach=True,
     ),
     # N.B.: we need to use `validate_postgres_stash=False` because testdrive uses
     # HEAD to load the catalog from disk but does *not* run migrations. There
@@ -65,7 +68,7 @@ SERVICES = [
     # because that would involve maintaining backwards compatibility for all
     # testdrive commands.
     Testdrive(
-        validate_postgres_stash=False,
+        validate_postgres_stash=None,
         volumes_extra=["secrets:/share/secrets"],
     ),
 ]
@@ -78,7 +81,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         "--min-version",
         metavar="VERSION",
         type=Version.parse,
-        default=Version.parse("0.27.0"),
+        default=Version.parse("0.39.0"),
         help="the minimum version to test from",
     )
     parser.add_argument(
@@ -166,6 +169,7 @@ def test_upgrade_from_version(
                 if from_version[1:] >= start_version
             ],
             volumes_extra=["secrets:/share/secrets"],
+            external_cockroach=True,
         )
         with c.override(mz_from):
             c.up("materialized")
@@ -199,7 +203,8 @@ def test_upgrade_from_version(
 
     with c.override(
         Testdrive(
-            validate_postgres_stash=True, volumes_extra=["secrets:/share/secrets"]
+            validate_postgres_stash="cockroach",
+            volumes_extra=["secrets:/share/secrets"],
         )
     ):
         c.run(
@@ -283,7 +288,7 @@ def ssl_services() -> Tuple[Kafka, SchemaRegistry, Testdrive]:
         volumes_extra=["secrets:/share/secrets"],
         # Required to install root certs above
         propagate_uid_gid=False,
-        validate_postgres_stash=False,
+        validate_postgres_stash=None,
     )
 
     return (kafka, schema_registry, testdrive)

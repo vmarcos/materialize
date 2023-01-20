@@ -95,6 +95,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use differential_dataflow::lattice::Lattice;
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use timely::order::TotalOrder;
 use timely::progress::Timestamp;
@@ -217,10 +218,10 @@ impl<T> Controller<T> {
     pub async fn remove_orphans(
         &mut self,
         next_replica_id: ReplicaId,
-        next_storage_host_id: GlobalId,
+        next_storage_cluster_id: GlobalId,
     ) -> Result<(), anyhow::Error> {
         self.compute.remove_orphans(next_replica_id).await?;
-        self.storage.remove_orphans(next_storage_host_id).await?;
+        self.storage.remove_orphans(next_storage_cluster_id).await?;
         Ok(())
     }
 }
@@ -288,9 +289,12 @@ where
     /// `source_ids` at the time of the function call.
     #[allow(unused)]
     #[allow(clippy::unused_async)]
-    pub async fn recent_timestamp(&self, source_ids: impl Iterator<Item = GlobalId>) -> T {
+    pub fn recent_timestamp(
+        &self,
+        source_ids: impl Iterator<Item = GlobalId>,
+    ) -> BoxFuture<'static, T> {
         // Dummy implementation
-        T::minimum()
+        Box::pin(async { T::minimum() })
     }
 }
 

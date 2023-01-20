@@ -2391,6 +2391,7 @@ impl<'a> Parser<'a> {
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_object_name()?;
         let (col_names, key_constraint) = self.parse_source_columns()?;
+        let in_cluster = self.parse_optional_in_cluster()?;
         self.expect_keyword(FROM)?;
         let connection = self.parse_create_source_connection()?;
         let format = match self.parse_one_of_keywords(&[KEY, FORMAT]) {
@@ -2436,6 +2437,7 @@ impl<'a> Parser<'a> {
 
         Ok(Statement::CreateSource(CreateSourceStatement {
             name,
+            in_cluster,
             col_names,
             connection,
             format,
@@ -2536,6 +2538,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(SINK)?;
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_object_name()?;
+        let in_cluster = self.parse_optional_in_cluster()?;
         self.expect_keyword(FROM)?;
         let from = self.parse_raw_name()?;
         self.expect_keyword(INTO)?;
@@ -2562,6 +2565,7 @@ impl<'a> Parser<'a> {
 
         Ok(Statement::CreateSink(CreateSinkStatement {
             name,
+            in_cluster,
             from,
             connection,
             format,
@@ -5545,22 +5549,13 @@ impl<'a> Parser<'a> {
                 self.expect_keyword(PLAN)?;
                 Some(ExplainStage::RawPlan)
             }
-            Some(QUERY) => {
-                self.expect_keyword(GRAPH)?;
-                Some(ExplainStage::QueryGraph)
-            }
             Some(DECORRELATED) => {
                 self.expect_keyword(PLAN)?;
                 Some(ExplainStage::DecorrelatedPlan)
             }
             Some(OPTIMIZED) => {
-                if self.parse_keyword(QUERY) {
-                    self.expect_keyword(GRAPH)?;
-                    Some(ExplainStage::OptimizedQueryGraph)
-                } else {
-                    self.expect_keyword(PLAN)?;
-                    Some(ExplainStage::OptimizedPlan)
-                }
+                self.expect_keyword(PLAN)?;
+                Some(ExplainStage::OptimizedPlan)
             }
             Some(PLAN) => Some(ExplainStage::OptimizedPlan), // EXPLAIN PLAN ~= EXPLAIN OPTIMIZED PLAN
             Some(PHYSICAL) => {

@@ -88,6 +88,7 @@ use uuid::Uuid;
 use mz_build_info::BuildInfo;
 use mz_cloud_resources::{CloudResourceController, VpcEndpointConfig};
 use mz_compute_client::controller::{ComputeInstanceEvent, ComputeInstanceId, ReplicaId};
+use mz_expr::{MirRelationExpr, OptimizedMirRelationExpr, RowSetFinishing};
 use mz_orchestrator::ServiceProcessMetrics;
 use mz_ore::cast::CastFrom;
 use mz_ore::metrics::MetricsRegistry;
@@ -99,17 +100,17 @@ use mz_ore::tracing::OpenTelemetryContext;
 use mz_ore::{stack, task};
 use mz_persist_client::usage::StorageUsageClient;
 use mz_persist_client::ShardId;
+use mz_repr::explain_new::ExplainFormat;
 use mz_repr::{Datum, Diff, GlobalId, Row, Timestamp};
 use mz_secrets::SecretsController;
 use mz_sql::ast::{CreateSourceStatement, CreateSubsourceStatement, Raw, Statement};
 use mz_sql::catalog::EnvironmentId;
 use mz_sql::names::Aug;
-use mz_sql::plan::{self, MutationKind, Params};
+use mz_sql::plan::{CopyFormat, MutationKind, Params, QueryWhen};
 use mz_storage_client::controller::{
     CollectionDescription, CreateExportToken, DataSource, StorageError,
 };
 use mz_storage_client::types::connections::ConnectionContext;
-use mz_storage_client::types::hosts::StorageHostConfig;
 use mz_storage_client::types::sinks::StorageSinkConnection;
 use mz_storage_client::types::sources::{IngestionDescription, SourceExport, Timeline};
 use mz_transform::Optimizer;
@@ -117,7 +118,7 @@ use mz_transform::Optimizer;
 use crate::catalog::builtin::{BUILTINS, MZ_VIEW_FOREIGN_KEYS, MZ_VIEW_KEYS};
 use crate::catalog::{
     self, storage, AwsPrincipalContext, BuiltinMigrationMetadata, BuiltinTableUpdate, Catalog,
-    CatalogItem, ClusterReplicaSizeMap, DataSourceDesc, StorageHostSizeMap,
+    CatalogItem, ClusterReplicaSizeMap, DataSourceDesc, StorageClusterSizeMap,
     StorageSinkConnectionState,
 };
 use crate::client::{Client, ConnectionId, Handle};
@@ -127,7 +128,7 @@ use crate::coord::appends::{BuiltinTableUpdateSource, Deferred, PendingWriteTxn}
 use crate::coord::id_bundle::CollectionIdBundle;
 use crate::coord::peek::PendingPeek;
 use crate::coord::read_policy::ReadCapability;
-use crate::coord::timeline::{TimelineState, WriteTimestamp};
+use crate::coord::timeline::{TimelineContext, TimelineState, WriteTimestamp};
 use crate::coord::timestamp_selection::TimestampContext;
 use crate::error::AdapterError;
 use crate::metrics::Metrics;
@@ -199,6 +200,11 @@ pub enum Message<T = mz_repr::Timestamp> {
     StorageUsageFetch,
     StorageUsageUpdate(HashMap<Option<ShardId>, u64>),
     Consolidate(Vec<mz_stash::Id>),
+    RealTimeRecencyTimestamp {
+        conn_id: ConnectionId,
+        transient_revision: u64,
+        real_time_recency_ts: Timestamp,
+    },
 }
 
 #[derive(Derivative)]
@@ -243,6 +249,43 @@ pub struct SinkConnectionReady {
     pub result: Result<StorageSinkConnection, AdapterError>,
 }
 
+#[derive(Debug)]
+pub enum RealTimeRecencyContext {
+    ExplainTimestamp {
+        tx: ClientTransmitter<ExecuteResponse>,
+        session: Session,
+        format: ExplainFormat,
+        compute_instance: ComputeInstanceId,
+        optimized_plan: OptimizedMirRelationExpr,
+        id_bundle: CollectionIdBundle,
+    },
+    Peek {
+        tx: ClientTransmitter<ExecuteResponse>,
+        finishing: RowSetFinishing,
+        copy_to: Option<CopyFormat>,
+        source: MirRelationExpr,
+        session: Session,
+        compute_instance: ComputeInstanceId,
+        when: QueryWhen,
+        target_replica: Option<ReplicaId>,
+        view_id: GlobalId,
+        index_id: GlobalId,
+        timeline_context: TimelineContext,
+        source_ids: BTreeSet<GlobalId>,
+        id_bundle: CollectionIdBundle,
+        in_immediate_multi_stmt_txn: bool,
+    },
+}
+
+impl RealTimeRecencyContext {
+    pub(crate) fn take_tx_and_session(self) -> (ClientTransmitter<ExecuteResponse>, Session) {
+        match self {
+            RealTimeRecencyContext::ExplainTimestamp { tx, session, .. }
+            | RealTimeRecencyContext::Peek { tx, session, .. } => (tx, session),
+        }
+    }
+}
+
 /// Configures a coordinator.
 pub struct Config {
     pub dataflow_client: mz_controller::Controller,
@@ -257,7 +300,7 @@ pub struct Config {
     pub cloud_resource_controller: Option<Arc<dyn CloudResourceController>>,
     pub availability_zones: Vec<String>,
     pub cluster_replica_sizes: ClusterReplicaSizeMap,
-    pub storage_host_sizes: StorageHostSizeMap,
+    pub storage_cluster_sizes: StorageClusterSizeMap,
     pub default_storage_host_size: Option<String>,
     pub bootstrap_system_parameters: BTreeMap<String, String>,
     pub connection_context: ConnectionContext,
@@ -430,8 +473,11 @@ pub struct Coordinator {
     /// A map from pending peek ids to the queue into which responses are sent, and
     /// the connection id of the client that initiated the peek.
     pending_peeks: HashMap<Uuid, PendingPeek>,
-    /// A map from client connection ids to a set of all pending peeks for that client
+    /// A map from client connection ids to a set of all pending peeks for that client.
     client_pending_peeks: HashMap<ConnectionId, BTreeMap<Uuid, ComputeInstanceId>>,
+
+    /// A map from client connection ids to a pending real time recency timestamps.
+    pending_real_time_recency_timestamp: HashMap<ConnectionId, RealTimeRecencyContext>,
 
     /// A map from pending subscribes to the subscribe description.
     pending_subscribes: HashMap<GlobalId, PendingSubscribe>,
@@ -440,7 +486,7 @@ pub struct Coordinator {
     write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Holds plans deferred due to write lock.
     write_lock_wait_group: VecDeque<Deferred>,
-    /// Pending writes waiting for a group commit
+    /// Pending writes waiting for a group commit.
     pending_writes: Vec<PendingWriteTxn>,
 
     /// Handle to secret manager that can create and delete secrets from
@@ -642,14 +688,17 @@ impl Coordinator {
                                 };
                                 source_exports.insert(subsource, export);
                             }
-
+                            let cluster_config = self
+                                .catalog
+                                .get_storage_cluster_config(entry.id())
+                                .expect("sources with ingestions always have linked clusters");
                             (
                                 DataSource::Ingestion(IngestionDescription {
                                     desc: ingestion.desc.clone(),
                                     ingestion_metadata: (),
                                     source_imports,
                                     source_exports,
-                                    host_config: ingestion.host_config.clone(),
+                                    cluster_config,
                                 }),
                                 source_status_collection_id,
                             )
@@ -991,49 +1040,6 @@ impl Coordinator {
         self.send_builtin_table_updates(builtin_table_updates, BuiltinTableUpdateSource::DDL)
             .await;
 
-        // TODO(benesch): remove this migration in v0.40, since all sources and
-        // sinks created in v0.39+ will be created with linked clusters if
-        // appropriate.
-        info!("coordinator init: SPECIAL MIGRATION: ensuring all sources and sinks have linked clusters");
-        let mut linked_cluster_ops = vec![];
-        for entry in &entries {
-            // Only sources with ingestions need linked clusters.
-            let host_config = match entry.item() {
-                CatalogItem::Source(source) => match &source.data_source {
-                    DataSourceDesc::Ingestion(ingestion) => &ingestion.host_config,
-                    _ => continue,
-                },
-                CatalogItem::Sink(sink) => &sink.host_config,
-                _ => continue,
-            };
-
-            // Don't create linked clusters if one already exists.
-            if self.catalog.get_linked_cluster(entry.id()).is_some() {
-                continue;
-            }
-
-            // Convert resolved host config back to the host config we would
-            // have gotten from the SQL layer.
-            let host_config = match host_config {
-                StorageHostConfig::Managed { size, .. } => {
-                    plan::StorageHostConfig::Managed { size: size.into() }
-                }
-                StorageHostConfig::Remote { addr } => {
-                    plan::StorageHostConfig::Remote { addr: addr.into() }
-                }
-            };
-
-            info!("adding linked cluster for {}", entry.id());
-            linked_cluster_ops.extend(
-                self.create_linked_cluster_ops(entry.id(), entry.name(), &host_config)
-                    .await?,
-            );
-        }
-        // Dummy session is appropriate for system migrations, as it will
-        // present as user `mz_system` in the audit log.
-        self.catalog_transact(Some(&Session::dummy()), linked_cluster_ops)
-            .await?;
-
         info!("coordinator init: bootstrap complete");
         Ok(())
     }
@@ -1167,7 +1173,7 @@ pub async fn serve(
         secrets_controller,
         cloud_resource_controller,
         cluster_replica_sizes,
-        storage_host_sizes,
+        storage_cluster_sizes,
         default_storage_host_size,
         bootstrap_system_parameters,
         mut availability_zones,
@@ -1228,8 +1234,8 @@ pub async fn serve(
             skip_migrations: false,
             metrics_registry: &metrics_registry,
             cluster_replica_sizes,
-            storage_host_sizes,
-            default_storage_host_size,
+            storage_cluster_sizes,
+            default_storage_cluster_size: default_storage_host_size,
             bootstrap_system_parameters,
             availability_zones,
             secrets_reader: secrets_controller.reader(),
@@ -1284,6 +1290,7 @@ pub async fn serve(
                 txn_reads: Default::default(),
                 pending_peeks: HashMap::new(),
                 client_pending_peeks: HashMap::new(),
+                pending_real_time_recency_timestamp: HashMap::new(),
                 pending_subscribes: HashMap::new(),
                 write_lock: Arc::new(tokio::sync::Mutex::new(())),
                 write_lock_wait_group: VecDeque::new(),

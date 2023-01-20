@@ -13,7 +13,7 @@
 //! `INSERT`, `SELECT`, `SUBSCRIBE`, and `COPY`.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use mz_expr::MirRelationExpr;
 use mz_ore::collections::CollectionExt;
@@ -195,14 +195,6 @@ pub fn describe_explain(
             relation_desc =
                 relation_desc.with_column("Raw Plan", ScalarType::String.nullable(false));
         }
-        ExplainStage::QueryGraph => {
-            relation_desc =
-                relation_desc.with_column("Query Graph", ScalarType::String.nullable(false));
-        }
-        ExplainStage::OptimizedQueryGraph => {
-            relation_desc = relation_desc
-                .with_column("Optimized Query Graph", ScalarType::String.nullable(false));
-        }
         ExplainStage::DecorrelatedPlan => {
             relation_desc =
                 relation_desc.with_column("Decorrelated Plan", ScalarType::String.nullable(false));
@@ -336,7 +328,7 @@ pub fn plan_explain(
     let config_flags = config_flags
         .iter()
         .map(|ident| ident.to_string().to_lowercase())
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let config = ExplainConfig::try_from(config_flags)?;
 
     let format = match format {

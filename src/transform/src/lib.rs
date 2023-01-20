@@ -106,6 +106,7 @@ pub mod demand;
 pub mod fold_constants;
 pub mod fusion;
 pub mod join_implementation;
+pub mod literal_constraints;
 pub mod literal_lifting;
 pub mod monotonic;
 pub mod nonnull_requirements;
@@ -322,16 +323,12 @@ impl Default for FuseAndCollapse {
             transforms: vec![
                 Box::new(crate::projection_extraction::ProjectionExtraction),
                 Box::new(crate::projection_lifting::ProjectionLifting::default()),
-                Box::new(crate::fusion::map::Map),
-                Box::new(crate::fusion::negate::Negate),
-                Box::new(crate::fusion::filter::Filter),
+                Box::new(crate::fusion::Fusion),
                 Box::new(crate::fusion::flatmap_to_map::FlatMapToMap),
-                Box::new(crate::fusion::project::Project),
                 Box::new(crate::fusion::join::Join),
-                Box::new(crate::fusion::top_k::TopK),
                 Box::new(crate::normalize_lets::NormalizeLets::new(false)),
                 Box::new(crate::fusion::reduce::Reduce),
-                Box::new(crate::fusion::union::Union),
+                Box::new(crate::fusion::union::UnionNegate),
                 // This goes after union fusion so we can cancel out
                 // more branches at a time.
                 Box::new(crate::union_cancel::UnionBranchCancellation),
@@ -469,11 +466,11 @@ impl Optimizer {
         // Implementation transformations
         let transforms: Vec<Box<dyn crate::Transform>> = vec![
             // It's important that
-            // - there is a run of CanonicalizeMfp before JoinImplementation lifts away the Filters
-            //   from the Gets;
-            // - there is no RelationCSE between this CanonicalizeMfp and JoinImplementation,
+            // - there is a run of LiteralConstraints before JoinImplementation lifts away the
+            //   Filters from the Gets;
+            // - there is no RelationCSE between this LiteralConstraints and JoinImplementation,
             //   because that could move an IndexedFilter behind a Get.
-            Box::new(crate::canonicalize_mfp::CanonicalizeMfp),
+            Box::new(crate::literal_constraints::LiteralConstraints),
             Box::new(crate::Fixpoint {
                 limit: 100,
                 transforms: vec![
@@ -509,18 +506,19 @@ impl Optimizer {
     pub fn logical_cleanup_pass() -> Self {
         let transforms: Vec<Box<dyn crate::Transform>> = vec![
             // Delete unnecessary maps.
-            Box::new(crate::fusion::map::Map),
+            Box::new(crate::fusion::Fusion),
             Box::new(crate::Fixpoint {
                 limit: 100,
                 transforms: vec![
+                    Box::new(crate::canonicalize_mfp::CanonicalizeMfp),
                     // Remove threshold operators which have no effect.
                     Box::new(crate::threshold_elision::ThresholdElision),
                     // Projection pushdown may unblock fusing joins and unions.
                     Box::new(crate::fusion::join::Join),
                     Box::new(crate::redundant_join::RedundantJoin::default()),
                     // Redundant join produces projects that need to be fused.
-                    Box::new(crate::fusion::project::Project),
-                    Box::new(crate::fusion::union::Union),
+                    Box::new(crate::fusion::Fusion),
+                    Box::new(crate::fusion::union::UnionNegate),
                     // This goes after union fusion so we can cancel out
                     // more branches at a time.
                     Box::new(crate::union_cancel::UnionBranchCancellation),

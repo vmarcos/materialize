@@ -550,6 +550,7 @@ impl_display_t!(CreateConnectionStatement);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CreateSourceStatement<T: AstInfo> {
     pub name: UnresolvedObjectName,
+    pub in_cluster: Option<T::ClusterName>,
     pub col_names: Vec<Ident>,
     pub connection: CreateSourceConnection<T>,
     pub include_metadata: Vec<SourceIncludeMetadata>,
@@ -568,21 +569,24 @@ impl<T: AstInfo> AstDisplay for CreateSourceStatement<T> {
             f.write_str("IF NOT EXISTS ");
         }
         f.write_node(&self.name);
-        f.write_str(" ");
         if !self.col_names.is_empty() {
-            f.write_str("(");
+            f.write_str(" (");
             f.write_node(&display::comma_separated(&self.col_names));
             if self.key_constraint.is_some() {
                 f.write_str(", ");
                 f.write_node(self.key_constraint.as_ref().unwrap());
             }
-            f.write_str(") ");
+            f.write_str(")");
         } else if self.key_constraint.is_some() {
-            f.write_str("(");
+            f.write_str(" (");
             f.write_node(self.key_constraint.as_ref().unwrap());
-            f.write_str(") ")
+            f.write_str(")")
         }
-        f.write_str("FROM ");
+        if let Some(cluster) = &self.in_cluster {
+            f.write_str(" IN CLUSTER ");
+            f.write_node(cluster);
+        }
+        f.write_str(" FROM ");
         f.write_node(&self.connection);
         f.write_node(&self.format);
         if !self.include_metadata.is_empty() {
@@ -720,6 +724,7 @@ impl<T: AstInfo> AstDisplay for CreateSinkOption<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CreateSinkStatement<T: AstInfo> {
     pub name: UnresolvedObjectName,
+    pub in_cluster: Option<T::ClusterName>,
     pub if_not_exists: bool,
     pub from: T::ObjectName,
     pub connection: CreateSinkConnection<T>,
@@ -735,6 +740,10 @@ impl<T: AstInfo> AstDisplay for CreateSinkStatement<T> {
             f.write_str("IF NOT EXISTS ");
         }
         f.write_node(&self.name);
+        if let Some(cluster) = &self.in_cluster {
+            f.write_str(" IN CLUSTER ");
+            f.write_node(cluster);
+        }
         f.write_str(" FROM ");
         f.write_node(&self.from);
         f.write_str(" INTO ");
@@ -2387,10 +2396,6 @@ impl_display_t!(Assignment);
 pub enum ExplainStage {
     /// The mz_sql::HirRelationExpr after parsing
     RawPlan,
-    /// Query Graph
-    QueryGraph,
-    /// Optimized Query Graph
-    OptimizedQueryGraph,
     /// The mz_expr::MirRelationExpr after decorrelation
     DecorrelatedPlan,
     /// The mz_expr::MirRelationExpr after optimization
@@ -2408,8 +2413,6 @@ impl ExplainStage {
     pub fn path(&self) -> &'static str {
         match self {
             ExplainStage::RawPlan => "optimize/raw",
-            ExplainStage::QueryGraph => "optimize/qgm/raw",
-            ExplainStage::OptimizedQueryGraph => "optimize/qgm/optimized",
             ExplainStage::DecorrelatedPlan => "optimize/hir_to_mir",
             ExplainStage::OptimizedPlan => "optimize/global",
             ExplainStage::PhysicalPlan => "optimize/mir_to_lir",
@@ -2423,8 +2426,6 @@ impl AstDisplay for ExplainStage {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             ExplainStage::RawPlan => f.write_str("RAW PLAN"),
-            ExplainStage::OptimizedQueryGraph => f.write_str("OPTIMIZED QUERY GRAPH"),
-            ExplainStage::QueryGraph => f.write_str("QUERY GRAPH"),
             ExplainStage::DecorrelatedPlan => f.write_str("DECORRELATED PLAN"),
             ExplainStage::OptimizedPlan => f.write_str("OPTIMIZED PLAN"),
             ExplainStage::PhysicalPlan => f.write_str("PHYSICAL PLAN"),

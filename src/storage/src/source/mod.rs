@@ -38,7 +38,6 @@ use crate::source::types::{NextMessage, SourceMessage, SourceReader};
 mod commit;
 mod delimited_value_reader;
 pub mod generator;
-pub mod healthcheck;
 mod kafka;
 mod kinesis;
 pub mod metrics;
@@ -47,7 +46,6 @@ mod reclock;
 mod resumption;
 mod s3;
 mod source_reader_pipeline;
-pub mod statistics;
 // Public for integration testing.
 #[doc(hidden)]
 pub mod testscript;

@@ -324,21 +324,26 @@ pub struct CreateSourcePlan {
     pub source: Source,
     pub if_not_exists: bool,
     pub timeline: Timeline,
-    pub host_config: StorageHostConfig,
+    pub cluster_config: StorageClusterConfig,
 }
 
-/// Settings related to storage hosts
+/// Settings related to storage clusters.
 ///
 /// This represents how resources for a storage instance are going to be
 /// provisioned, based on the SQL logic. Storage equivalent of ComputeReplicaConfig.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum StorageHostConfig {
-    /// Remote unmanaged storage
+pub enum StorageClusterConfig {
+    /// Use an existing cluster.
+    Cluster {
+        /// The ID of the cluster to use.
+        id: ComputeInstanceId,
+    },
+    /// Remote unmanaged storage.
     Remote {
         /// The network address of the clusterd process.
         addr: String,
     },
-    /// A remote but managed storage host
+    /// Create a new linked storage cluster of the specified size.
     Managed {
         /// SQL size parameter used for allocation
         size: String,
@@ -368,7 +373,7 @@ pub struct CreateSinkPlan {
     pub sink: Sink,
     pub with_snapshot: bool,
     pub if_not_exists: bool,
-    pub host_config: StorageHostConfig,
+    pub cluster_config: StorageClusterConfig,
 }
 
 #[derive(Debug)]
@@ -835,15 +840,11 @@ impl Params {
 #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, Copy)]
 pub struct PlanContext {
     pub wall_time: DateTime<Utc>,
-    pub qgm_optimizations: bool,
 }
 
 impl PlanContext {
-    pub fn new(wall_time: DateTime<Utc>, qgm_optimizations: bool) -> Self {
-        Self {
-            wall_time,
-            qgm_optimizations,
-        }
+    pub fn new(wall_time: DateTime<Utc>) -> Self {
+        Self { wall_time }
     }
 
     /// Return a PlanContext with zero values. This should only be used when
@@ -852,7 +853,6 @@ impl PlanContext {
     pub fn zero() -> Self {
         PlanContext {
             wall_time: now::to_datetime(NOW_ZERO()),
-            qgm_optimizations: false,
         }
     }
 }

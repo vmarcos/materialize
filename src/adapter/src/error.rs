@@ -22,7 +22,6 @@ use mz_ore::str::StrExt;
 use mz_repr::explain_new::ExplainError;
 use mz_repr::NotNullViolation;
 use mz_sql::plan::PlanError;
-use mz_sql::query_model::QGMError;
 use mz_storage_client::controller::StorageError;
 use mz_transform::TransformError;
 
@@ -88,11 +87,12 @@ pub enum AdapterError {
         expected: Vec<String>,
     },
     /// No such storage instance size has been configured.
-    InvalidStorageHostSize {
+    InvalidStorageClusterSize {
         size: String,
         expected: Vec<String>,
     },
-    StorageHostSizeRequired {
+    /// Creating a source or sink without specifying its size is forbidden.
+    SourceOrSinkSizeRequired {
         expected: Vec<String>,
     },
     /// The selection value for a table mutation operation refers to an invalid object.
@@ -109,8 +109,6 @@ pub enum AdapterError {
     PlanError(PlanError),
     /// The named prepared statement already exists.
     PreparedStatementExists(String),
-    /// An error occurred in the QGM stage of the optimizer.
-    QGM(QGMError),
     /// The transaction is in read-only mode.
     ReadOnlyTransaction,
     /// The specified session parameter is read-only.
@@ -184,10 +182,6 @@ pub enum AdapterError {
     UntargetedLogRead {
         log_names: Vec<String>,
     },
-    /// Attempted to subscribe to a log source.
-    TargetedSubscribe {
-        log_names: Vec<String>,
-    },
     /// The transaction is in write-only mode.
     WriteOnlyTransaction,
     /// The transaction only supports single table writes
@@ -231,8 +225,7 @@ impl AdapterError {
                     .into(),
             ),
             AdapterError::IntrospectionDisabled { log_names }
-            | AdapterError::UntargetedLogRead { log_names }
-            | AdapterError::TargetedSubscribe { log_names } => Some(format!(
+            | AdapterError::UntargetedLogRead { log_names } => Some(format!(
                 "The query references the following log sources:\n    {}",
                 log_names.join("\n    "),
             )),
@@ -282,10 +275,10 @@ impl AdapterError {
                 "Valid cluster replica sizes are: {}",
                 expected.join(", ")
             )),
-            AdapterError::InvalidStorageHostSize { expected, .. } => {
+            AdapterError::InvalidStorageClusterSize { expected, .. } => {
                 Some(format!("Valid sizes are: {}", expected.join(", ")))
             }
-            Self::StorageHostSizeRequired { expected } => Some(format!(
+            AdapterError::SourceOrSinkSizeRequired { expected } => Some(format!(
                 "Try choosing one of the smaller sizes to start. Available sizes: {}",
                 expected.join(", ")
             )),
@@ -297,7 +290,7 @@ impl AdapterError {
             }
             AdapterError::UntargetedLogRead { .. } => Some(
                 "Use `SET cluster_replica = <replica-name>` to target a specific replica in the \
-                 active cluster. Note that subsequent `SELECT` queries will only be answered by \
+                 active cluster. Note that subsequent queries will only be answered by \
                  the selected replica, which might reduce availability. To undo the replica \
                  selection, use `RESET cluster_replica`."
                     .into(),
@@ -372,10 +365,10 @@ impl fmt::Display for AdapterError {
             AdapterError::InvalidClusterReplicaSize { size, expected: _ } => {
                 write!(f, "unknown cluster replica size {size}",)
             }
-            AdapterError::InvalidStorageHostSize { size, .. } => {
+            AdapterError::InvalidStorageClusterSize { size, .. } => {
                 write!(f, "unknown source size {size}")
             }
-            Self::StorageHostSizeRequired { .. } => {
+            AdapterError::SourceOrSinkSizeRequired { .. } => {
                 write!(f, "size option is required")
             }
             AdapterError::InvalidTableMutationSelection => {
@@ -401,7 +394,6 @@ impl fmt::Display for AdapterError {
             AdapterError::PreparedStatementExists(name) => {
                 write!(f, "prepared statement {} already exists", name.quoted())
             }
-            AdapterError::QGM(e) => e.fmt(f),
             AdapterError::ReadOnlyTransaction => f.write_str("transaction in read-only mode"),
             AdapterError::ReadOnlyParameter(p) => {
                 write!(f, "parameter {} cannot be changed", p.name().quoted())
@@ -485,9 +477,6 @@ impl fmt::Display for AdapterError {
             AdapterError::UntargetedLogRead { .. } => {
                 f.write_str("log source reads must target a replica")
             }
-            AdapterError::TargetedSubscribe { .. } => {
-                f.write_str("SUBSCRIBE cannot reference a log source")
-            }
             AdapterError::MultiTableWriteTransaction => {
                 f.write_str("write transactions only support writes to a single table")
             }
@@ -549,12 +538,6 @@ impl From<mz_sql::catalog::CatalogError> for AdapterError {
 impl From<PlanError> for AdapterError {
     fn from(e: PlanError) -> AdapterError {
         AdapterError::PlanError(e)
-    }
-}
-
-impl From<QGMError> for AdapterError {
-    fn from(e: QGMError) -> AdapterError {
-        AdapterError::QGM(e)
     }
 }
 

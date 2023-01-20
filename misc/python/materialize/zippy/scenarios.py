@@ -212,6 +212,29 @@ class CrdbMinioRestart(Scenario):
         }
 
 
+class CrdbRestart(Scenario):
+    """A Zippy test that restarts Cockroach."""
+
+    def bootstrap(self) -> List[ActionOrFactory]:
+        return DEFAULT_BOOTSTRAP
+
+    def config(self) -> Dict[ActionOrFactory, float]:
+        return {
+            CreateTopicParameterized(): 5,
+            CreateSourceParameterized(): 5,
+            CreateViewParameterized(max_inputs=2): 5,
+            CreateSinkParameterized(): 5,
+            Ingest: 50,
+            CreateTableParameterized(): 10,
+            DML: 50,
+            ValidateView: 15,
+            MzRestart: 5,
+            KillClusterd: 5,
+            StoragedRestart: 10,
+            CockroachRestart: 15,
+        }
+
+
 class KafkaSourcesLarge(Scenario):
     """A Zippy test using a large number of Kafka sources, views and sinks."""
 
@@ -256,6 +279,27 @@ class DataflowsLarge(Scenario):
             CreateViewParameterized(
                 max_views=5, expensive_aggregates=True, max_inputs=5
             ): 10,
+            ValidateView: 10,
+            Ingest: 50,
+            DML: 50,
+        }
+
+
+class NoKilling(Scenario):
+    """A Zippy scenario that does not involve any killing."""
+
+    def bootstrap(self) -> List[ActionOrFactory]:
+        return DEFAULT_BOOTSTRAP
+
+    def config(self) -> Dict[ActionOrFactory, float]:
+        return {
+            CreateTableParameterized(max_tables=2): 10,
+            CreateTopicParameterized(max_topics=2, envelopes=[Envelope.UPSERT]): 10,
+            CreateSourceParameterized(max_sources=10): 10,
+            CreateViewParameterized(
+                max_views=5, expensive_aggregates=True, max_inputs=5
+            ): 10,
+            CreateSinkParameterized(max_sinks=10): 10,
             ValidateView: 10,
             Ingest: 50,
             DML: 50,

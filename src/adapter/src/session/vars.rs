@@ -129,13 +129,6 @@ const INTERVAL_STYLE: ServerVar<str> = ServerVar {
 
 const MZ_VERSION_NAME: &UncasedStr = UncasedStr::new("mz_version");
 
-const QGM_OPTIMIZATIONS: ServerVar<bool> = ServerVar {
-    name: UncasedStr::new("qgm_optimizations_experimental"),
-    value: &false,
-    description: "Enables optimizations based on a Query Graph Model (QGM) query representation.",
-    internal: false,
-};
-
 static DEFAULT_SEARCH_PATH: Lazy<[String; 1]> = Lazy::new(|| [DEFAULT_SCHEMA.to_owned()]);
 static SEARCH_PATH: Lazy<ServerVar<[String]>> = Lazy::new(|| ServerVar {
     name: UncasedStr::new("search_path"),
@@ -313,13 +306,13 @@ pub const MAX_RESULT_SIZE: ServerVar<u32> = ServerVar {
 /// The logical compaction window for builtin tables and sources that have the
 /// `retained_metrics_relation` flag set.
 ///
-/// The existence of this variable is a bit of a hack until we have a fully general
-/// solution for controlling retention windows.
+/// The existence of this variable is a bit of a hack until we have a fully
+/// general solution for controlling retention windows.
 pub const METRICS_RETENTION: ServerVar<Duration> = ServerVar {
     name: UncasedStr::new("metrics_retention"),
     // 30 days
     value: &Duration::from_secs(30 * 24 * 60 * 60),
-    description: "The time to retain cluster and storage host utilization metrics (Materialize).",
+    description: "The time to retain cluster utilization metrics (Materialize).",
     internal: true,
 };
 
@@ -330,14 +323,6 @@ static ALLOWED_CLUSTER_REPLICA_SIZES: Lazy<ServerVar<Vec<String>>> = Lazy::new(|
     description: "The allowed sizes when creating a new cluster replica (Materialize).",
     internal: false,
 });
-
-/// Feature flag indicating whether window functions are enabled.
-static WINDOW_FUNCTIONS: ServerVar<bool> = ServerVar {
-    name: UncasedStr::new("window_functions"),
-    value: &true,
-    description: "Feature flag indicating whether window functions are enabled (Materialize).",
-    internal: false,
-};
 
 /// Controls [`PersistConfig::blob_target_size`].
 const PERSIST_BLOB_TARGET_SIZE: ServerVar<usize> = ServerVar {
@@ -432,7 +417,6 @@ pub struct SessionVars {
     failpoints: ServerVar<str>,
     integer_datetimes: ServerVar<bool>,
     interval_style: ServerVar<str>,
-    qgm_optimizations: SessionVar<bool>,
     search_path: SessionVar<[String]>,
     server_version: ServerVar<str>,
     server_version_num: ServerVar<i32>,
@@ -463,7 +447,6 @@ impl SessionVars {
             failpoints: FAILPOINTS,
             integer_datetimes: INTEGER_DATETIMES,
             interval_style: INTERVAL_STYLE,
-            qgm_optimizations: SessionVar::new(&QGM_OPTIMIZATIONS),
             search_path: SessionVar::new(&SEARCH_PATH),
             server_version: SERVER_VERSION,
             server_version_num: SERVER_VERSION_NUM,
@@ -491,7 +474,7 @@ impl SessionVars {
     /// Returns an iterator over the configuration parameters and their current
     /// values for this session.
     pub fn iter(&self) -> impl Iterator<Item = &dyn Var> {
-        let vars: [&dyn Var; 25] = [
+        let vars: [&dyn Var; 24] = [
             &self.application_name,
             self.build_info,
             &self.client_encoding,
@@ -504,7 +487,6 @@ impl SessionVars {
             &self.failpoints,
             &self.integer_datetimes,
             &self.interval_style,
-            &self.qgm_optimizations,
             &self.search_path,
             &self.server_version,
             &self.server_version_num,
@@ -580,8 +562,6 @@ impl SessionVars {
             Ok(&self.interval_style)
         } else if name == MZ_VERSION_NAME {
             Ok(self.build_info)
-        } else if name == QGM_OPTIMIZATIONS.name {
-            Ok(&self.qgm_optimizations)
         } else if name == SEARCH_PATH.name {
             Ok(&self.search_path)
         } else if name == SERVER_VERSION.name {
@@ -698,8 +678,6 @@ impl SessionVars {
             } else {
                 Ok(())
             }
-        } else if name == QGM_OPTIMIZATIONS.name {
-            self.qgm_optimizations.set(value, local)
         } else if name == SEARCH_PATH.name {
             self.search_path.set(value, local)
         } else if name == SERVER_VERSION.name {
@@ -776,8 +754,6 @@ impl SessionVars {
             self.database.reset(local);
         } else if name == EXTRA_FLOAT_DIGITS.name {
             self.extra_float_digits.reset(local);
-        } else if name == QGM_OPTIMIZATIONS.name {
-            self.qgm_optimizations.reset(local);
         } else if name == SEARCH_PATH.name {
             self.search_path.reset(local);
         } else if name == SQL_SAFE_UPDATES.name {
@@ -830,7 +806,6 @@ impl SessionVars {
             failpoints: _,
             integer_datetimes: _,
             interval_style: _,
-            qgm_optimizations,
             search_path,
             server_version: _,
             server_version_num: _,
@@ -850,7 +825,6 @@ impl SessionVars {
         cluster_replica.end_transaction(action);
         database.end_transaction(action);
         extra_float_digits.end_transaction(action);
-        qgm_optimizations.end_transaction(action);
         search_path.end_transaction(action);
         sql_safe_updates.end_transaction(action);
         statement_timeout.end_transaction(action);
@@ -920,11 +894,6 @@ impl SessionVars {
     /// Returns the value of the `mz_version` configuration parameter.
     pub fn mz_version(&self) -> String {
         self.build_info.value()
-    }
-
-    /// Returns the value of the `qgm_optimizations` configuration parameter.
-    pub fn qgm_optimizations(&self) -> bool {
-        *self.qgm_optimizations.value()
     }
 
     /// Returns the value of the `search_path` configuration parameter.
@@ -1019,7 +988,7 @@ pub struct SystemVars {
     allowed_cluster_replica_sizes: SystemVar<Vec<String>>, // TODO: BTreeSet<String> will be better
 
     // features
-    window_functions: SystemVar<bool>,
+    // (empty)
 
     // persist configuration
     persist_blob_target_size: SystemVar<usize>,
@@ -1047,7 +1016,6 @@ impl Default for SystemVars {
             max_roles: SystemVar::new(&MAX_ROLES),
             max_result_size: SystemVar::new(&MAX_RESULT_SIZE),
             allowed_cluster_replica_sizes: SystemVar::new(&ALLOWED_CLUSTER_REPLICA_SIZES),
-            window_functions: SystemVar::new(&WINDOW_FUNCTIONS),
             persist_blob_target_size: SystemVar::new(&PERSIST_BLOB_TARGET_SIZE),
             persist_compaction_minimum_timeout: SystemVar::new(&PERSIST_COMPACTION_MINIMUM_TIMEOUT),
             metrics_retention: SystemVar::new(&METRICS_RETENTION),
@@ -1059,7 +1027,7 @@ impl SystemVars {
     /// Returns an iterator over the configuration parameters and their current
     /// values on disk.
     pub fn iter(&self) -> impl Iterator<Item = &dyn Var> {
-        let vars: [&dyn Var; 19] = [
+        let vars: [&dyn Var; 18] = [
             &self.config_has_synced_once,
             &self.max_aws_privatelink_connections,
             &self.max_tables,
@@ -1075,7 +1043,6 @@ impl SystemVars {
             &self.max_roles,
             &self.max_result_size,
             &self.allowed_cluster_replica_sizes,
-            &self.window_functions,
             &self.persist_blob_target_size,
             &self.persist_compaction_minimum_timeout,
             &self.metrics_retention,
@@ -1084,7 +1051,8 @@ impl SystemVars {
     }
 
     /// Returns an iterator over the configuration parameters and their current
-    /// values on disk.
+    /// values on disk. Compared to [`SystemVars::iter`], this should omit vars
+    /// that shouldn't be synced by [`crate::config::SystemParameterFrontend`].
     pub fn iter_synced(&self) -> impl Iterator<Item = &dyn Var> {
         self.iter()
             .filter(|v| v.name() != CONFIG_HAS_SYNCED_ONCE.name)
@@ -1136,8 +1104,6 @@ impl SystemVars {
             Ok(&self.max_result_size)
         } else if name == ALLOWED_CLUSTER_REPLICA_SIZES.name {
             Ok(&self.allowed_cluster_replica_sizes)
-        } else if name == WINDOW_FUNCTIONS.name {
-            Ok(&self.window_functions)
         } else if name == PERSIST_BLOB_TARGET_SIZE.name {
             Ok(&self.persist_blob_target_size)
         } else if name == PERSIST_COMPACTION_MINIMUM_TIMEOUT.name {
@@ -1189,8 +1155,6 @@ impl SystemVars {
             self.max_result_size.is_default(value)
         } else if name == ALLOWED_CLUSTER_REPLICA_SIZES.name {
             self.allowed_cluster_replica_sizes.is_default(value)
-        } else if name == WINDOW_FUNCTIONS.name {
-            self.window_functions.is_default(value)
         } else if name == PERSIST_BLOB_TARGET_SIZE.name {
             self.persist_blob_target_size.is_default(value)
         } else if name == PERSIST_COMPACTION_MINIMUM_TIMEOUT.name {
@@ -1251,8 +1215,6 @@ impl SystemVars {
             self.max_result_size.set(value)
         } else if name == ALLOWED_CLUSTER_REPLICA_SIZES.name {
             self.allowed_cluster_replica_sizes.set(value)
-        } else if name == WINDOW_FUNCTIONS.name {
-            self.window_functions.set(value)
         } else if name == PERSIST_BLOB_TARGET_SIZE.name {
             self.persist_blob_target_size.set(value)
         } else if name == PERSIST_COMPACTION_MINIMUM_TIMEOUT.name {
@@ -1308,8 +1270,6 @@ impl SystemVars {
             Ok(self.max_result_size.reset())
         } else if name == ALLOWED_CLUSTER_REPLICA_SIZES.name {
             Ok(self.allowed_cluster_replica_sizes.reset())
-        } else if name == WINDOW_FUNCTIONS.name {
-            Ok(self.window_functions.reset())
         } else if name == PERSIST_BLOB_TARGET_SIZE.name {
             Ok(self.persist_blob_target_size.reset())
         } else if name == PERSIST_COMPACTION_MINIMUM_TIMEOUT.name {
@@ -1396,11 +1356,6 @@ impl SystemVars {
         self.allowed_cluster_replica_sizes.value()
     }
 
-    /// Returns the `window_functions` configuration parameter.
-    pub fn window_functions(&self) -> bool {
-        *self.window_functions.value()
-    }
-
     /// Returns the `persist_blob_target_size` configuration parameter.
     pub fn persist_blob_target_size(&self) -> usize {
         *self.persist_blob_target_size.value()
@@ -1411,6 +1366,7 @@ impl SystemVars {
         *self.persist_compaction_minimum_timeout.value()
     }
 
+    /// Returns the `metrics_retention` configuration parameter.
     pub fn metrics_retention(&self) -> Duration {
         *self.metrics_retention.value()
     }

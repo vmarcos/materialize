@@ -112,7 +112,7 @@ RUN curl -fsSL https://github.com/benesch/autouseradd/releases/download/1.3.0/au
     && tar -xJf shellcheck.tar.xz -C /usr/local/bin --strip-components 1 shellcheck-v0.8.0/shellcheck \
     && rm shellcheck.tar.xz \
     && mkdir -p /usr/local/lib/docker/cli-plugins \
-    && curl -fsSL https://github.com/docker/compose/releases/download/v2.6.0/docker-compose-linux-$ARCH_GCC > /usr/local/lib/docker/cli-plugins/docker-compose \
+    && curl -fsSL https://github.com/docker/compose/releases/download/v2.15.1/docker-compose-linux-$ARCH_GCC > /usr/local/lib/docker/cli-plugins/docker-compose \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 ENTRYPOINT ["autouseradd", "--user", "materialize"]
@@ -154,7 +154,8 @@ RUN mkdir rust \
     && cargo install --root /usr/local --version "=0.12.2" cargo-deny \
     && cargo install --root /usr/local --version ="0.9.18" cargo-hakari \
     && cargo install --root /usr/local --version "=0.9.44" cargo-nextest \
-    && cargo install --root /usr/local --version "=0.1.34" cargo-udeps  --features=vendored-openssl \
+    && `: Until https://github.com/est31/cargo-udeps/pull/147 is released in cargo-udeps` \
+    && cargo install --root /usr/local --git https://github.com/est31/cargo-udeps --rev=b84d478ef3efd7264dba8c15c31a50c6399dc5bb --locked  cargo-udeps --features=vendored-openssl \
     && cargo install --root /usr/local --version "=0.2.15" --no-default-features --features=s3,openssl/vendored sccache
 
 # Link the system lld into the cross-compiling sysroot.

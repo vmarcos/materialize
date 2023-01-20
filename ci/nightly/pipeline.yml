@@ -38,6 +38,7 @@ steps:
           - { value: zippy-postgres-cdc }
           - { value: zippy-cluster-replicas }
           - { value: zippy-crdb-minio-restart }
+          - { value: zippy-crdb-latest-restart }
           - { value: secrets }
           - { value: checks-oneatatime-drop-create-default-replica }
           - { value: checks-oneatatime-restart-clusterd-compute }
@@ -63,6 +64,7 @@ steps:
           - { value: unused-deps }
           - { value: launchdarkly }
           - { value: bounded-memory }
+          - { value: cloud-canary }
         multiple: true
         required: false
     if: build.source == "ui"
@@ -311,6 +313,16 @@ steps:
           composition: zippy
           args: [--scenario=CrdbMinioRestart, --actions=1000]
 
+  - id: zippy-crdb-latest-restart
+    label: "Zippy CRDB restarts w/ latest CRDB"
+    timeout_in_minutes: 120
+    agents:
+      queue: linux-x86_64
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: zippy
+          args: [--scenario=CrdbRestart, --actions=1000, --cockroach-tag=latest]
+
   - id: secrets
     label: "Secrets"
     timeout_in_minutes: 30
@@ -555,7 +567,6 @@ steps:
     timeout_in_minutes: 30
     agents:
       queue: linux-x86_64
-    soft_fail: true
 
   - id: launchdarkly
     label: "LaunchDarkly"
@@ -576,3 +587,13 @@ steps:
     plugins:
       - ./ci/plugins/mzcompose:
           composition: bounded-memory
+
+  - id: cloud-canary
+    label: "Canary Deploy in Staging Cloud"
+    artifact_paths: junit_mzcompose_*.xml
+    timeout_in_minutes: 1200
+    agents:
+      queue: linux-x86_64
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: cloud-canary

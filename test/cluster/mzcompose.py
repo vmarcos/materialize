@@ -10,6 +10,7 @@
 import re
 import time
 from textwrap import dedent
+from threading import Thread
 from typing import Tuple
 
 from pg8000.dbapi import ProgrammingError
@@ -24,7 +25,6 @@ from materialize.mzcompose.services import (
     Postgres,
     Redpanda,
     SchemaRegistry,
-    Service,
     Testdrive,
     Zookeeper,
 )
@@ -34,20 +34,17 @@ SERVICES = [
     Kafka(),
     SchemaRegistry(),
     Localstack(),
+    Cockroach(setup_materialize=True),
     Clusterd(name="compute_1"),
     Clusterd(name="compute_2"),
     Clusterd(name="compute_3"),
     Clusterd(name="compute_4"),
     # We use mz_panic() in some test scenarios, so environmentd must stay up.
-    Materialized(propagate_crashes=False),
+    Materialized(propagate_crashes=False, external_cockroach=True),
     Redpanda(),
     Testdrive(
-        volumes=[
-            "mzdata:/mzdata",
-            "tmp:/share/tmp",
-            ".:/workdir/smoke",
-            "../testdrive:/workdir/testdrive",
-        ],
+        volume_workdir="../testdrive:/workdir/testdrive",
+        volumes_extra=[".:/workdir/smoke"],
         materialize_params={"cluster": "cluster1"},
     ),
     Clusterd(name="storage"),
@@ -67,9 +64,9 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         "test-upsert",
         "test-resource-limits",
         "test-invalid-compute-reuse",
-        "test-builtin-migration",
         "pg-snapshot-resumption",
         "test-system-table-indexes",
+        "test-replica-targeted-subscribe-abort",
     ]:
         with c.test_case(name):
             c.workflow(name)
@@ -544,15 +541,10 @@ def workflow_test_remote_storage(c: Composition) -> None:
 
     with c.override(
         Testdrive(default_timeout="15s", no_reset=True, consistent_seed=True),
-        # Use a separate CockroachDB service for persist rather than the one in
-        # the `Materialized` service, so that crashing `environmentd` does not
-        # also take down CockroachDB.
-        Cockroach(setup_materialize=True),
-        Materialized(external_cockroach=True),
     ):
         dependencies = [
-            "materialized",
             "cockroach",
+            "materialized",
             "storage",
             "zookeeper",
             "kafka",
@@ -605,181 +597,6 @@ def workflow_test_resource_limits(c: Composition) -> None:
         )
 
         c.run("testdrive", "resources/resource-limits.td")
-
-
-def workflow_test_builtin_migration(c: Composition) -> None:
-    """Exercise the builtin object migration code by upgrading between two versions
-    that will have a migration triggered between them. Create a materialized view
-    over the affected builtin object to confirm that the migration was successful
-    """
-
-    c.down(destroy_volumes=True)
-    with c.override(
-        # Random commit before the migrations that we are testing.
-        Service(
-            name="materialized",
-            config={
-                "image": "materialize/materialized:devel-aa4128c9c485322f90ab0af2b9cb4d16e1c470c0",
-                "command": ["--persist-blob-url=file:///mzdata/persist/blob"],
-                "ports": [6875],
-                "volumes": [
-                    "mzdata:/mzdata",
-                    "pgdata:/cockroach-data",
-                ],
-            },
-        ),
-        Testdrive(default_timeout="15s", no_reset=True, consistent_seed=True),
-    ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.wait_for_materialized()
-
-        c.testdrive(
-            input=dedent(
-                """
-        # pg_catalog.pg_proc migration
-
-        # The limit is added to avoid having to update the number every time we add a function.
-        > CREATE VIEW v1 AS SELECT COUNT(*) FROM (SELECT * FROM pg_proc ORDER BY oid LIMIT 5);
-        > SELECT * FROM v1;
-        5
-        ! SELECT DISTINCT proowner FROM pg_proc;
-        contains:column "proowner" does not exist
-
-        # mz_internal.mz_dataflow_operator_reachability migration
-
-        # Populate mz_dataflow_operator_reachability
-        > CREATE TABLE t (a INT);
-        > CREATE DEFAULT INDEX ON t;
-
-        > SELECT pg_typeof(address) FROM mz_internal.mz_dataflow_operator_reachability LIMIT 1;
-        "bigint list"
-
-        # mz_internal.mz_cluster_replica_statuses migration
-
-        > SELECT pg_typeof(process_id) FROM mz_internal.mz_cluster_replica_statuses LIMIT 1;
-        "bigint"
-
-        ! SELECT updated_at FROM mz_internal.mz_cluster_replica_statuses;
-        contains:column "updated_at" does not exist
-
-        > SELECT last_update FROM mz_internal.mz_cluster_replica_statuses LIMIT 0;
-
-        # mz_internal.mz_show_cluster_replicas migration
-
-        ! SELECT ready FROM mz_internal.mz_show_cluster_replicas LIMIT 0;
-        contains:column "ready" does not exist
-
-        # mz_catalog.mz_sources migration
-
-        > CREATE MATERIALIZED VIEW source_types AS SELECT type FROM mz_catalog.mz_sources WHERE id LIKE 'u%';
-
-        > CREATE SOURCE load_gen_source FROM LOAD GENERATOR COUNTER WITH (SIZE '1');
-
-        > SELECT * FROM source_types
-        load-generator
-    """
-            )
-        )
-
-        c.kill("materialized")
-
-    with c.override(
-        # This will stop working if we introduce a breaking change.
-        Materialized(),
-        Testdrive(default_timeout="15s", no_reset=True, consistent_seed=True),
-    ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.wait_for_materialized()
-
-        c.testdrive(
-            input=dedent(
-                """
-        # pg_catalog.pg_proc migration
-
-        > SELECT * FROM v1;
-        5
-        # This column is new after the migration
-        > SELECT DISTINCT proowner FROM pg_proc;
-        <null>
-
-        # mz_internal.mz_dataflow_operator_reachability migration
-
-        > SELECT pg_typeof(address) FROM mz_internal.mz_dataflow_operator_reachability LIMIT 1;
-        "uint8 list"
-
-        # mz_internal.mz_cluster_replica_statuses migration
-
-        > SELECT pg_typeof(process_id) FROM mz_internal.mz_cluster_replica_statuses LIMIT 1;
-        "uint8"
-
-        ! SELECT last_update FROM mz_internal.mz_cluster_replica_statuses;
-        contains:column "last_update" does not exist
-
-        > SELECT updated_at FROM mz_internal.mz_cluster_replica_statuses LIMIT 0;
-
-        # mz_internal.mz_show_cluster_replicas migration
-
-        > SELECT ready FROM mz_internal.mz_show_cluster_replicas LIMIT 0;
-
-        # mz_catalog.mz_sources migration
-
-        > SELECT * FROM source_types
-        load-generator
-    """
-            )
-        )
-
-    # Restart materialize and test that everything still works to ensure that the migration was persisted correctly.
-    with c.override(
-        # This will stop working if we introduce a breaking change.
-        Materialized(),
-        Testdrive(default_timeout="15s", no_reset=True, consistent_seed=True),
-    ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.wait_for_materialized()
-
-        c.testdrive(
-            input=dedent(
-                """
-        # pg_catalog.pg_proc migration
-
-        > SELECT * FROM v1;
-        5
-        # This column is new after the migration
-        > SELECT DISTINCT proowner FROM pg_proc;
-        <null>
-
-        # mz_internal.mz_dataflow_operator_reachability migration
-
-        > SELECT pg_typeof(address) FROM mz_internal.mz_dataflow_operator_reachability LIMIT 1;
-        "uint8 list"
-
-        # mz_internal.mz_cluster_replica_statuses migration
-
-        > SELECT pg_typeof(process_id) FROM mz_internal.mz_cluster_replica_statuses LIMIT 1;
-        "uint8"
-
-        ! SELECT last_update FROM mz_internal.mz_cluster_replica_statuses;
-        contains:column "last_update" does not exist
-
-        > SELECT updated_at FROM mz_internal.mz_cluster_replica_statuses LIMIT 0;
-
-        # mz_internal.mz_show_cluster_replicas migration
-
-        > SELECT ready FROM mz_internal.mz_show_cluster_replicas LIMIT 0;
-
-        # mz_catalog.mz_sources migration
-
-        # mz_catalog.mz_sources migration
-
-        > SELECT * FROM source_types
-        load-generator
-    """
-            )
-        )
 
 
 def workflow_pg_snapshot_resumption(c: Composition) -> None:
@@ -903,3 +720,75 @@ def workflow_test_system_table_indexes(c: Composition) -> None:
     """
             )
         )
+
+
+def workflow_test_replica_targeted_subscribe_abort(c: Composition) -> None:
+    """
+    Test that a replica-targeted SUBSCRIBE is aborted when the target
+    replica disconnects.
+    """
+
+    c.down(destroy_volumes=True)
+    c.up("materialized")
+    c.up("compute_1")
+    c.up("compute_2")
+    c.wait_for_materialized()
+
+    c.sql(
+        """
+        DROP CLUSTER IF EXISTS cluster1 CASCADE;
+        CREATE CLUSTER cluster1 REPLICAS (
+            replica1 (REMOTE ['compute_1:2101'], COMPUTE ['compute_1:2102'], WORKERS 2),
+            replica2 (REMOTE ['compute_2:2101'], COMPUTE ['compute_2:2102'], WORKERS 2)
+        );
+        CREATE TABLE t (a int);
+        """
+    )
+
+    def drop_replica_with_delay() -> None:
+        time.sleep(2)
+        c.sql("DROP CLUSTER REPLICA cluster1.replica1;")
+
+    dropper = Thread(target=drop_replica_with_delay)
+    dropper.start()
+
+    try:
+        c.sql(
+            """
+            SET cluster = cluster1;
+            SET cluster_replica = replica1;
+            BEGIN;
+            DECLARE c CURSOR FOR SUBSCRIBE t;
+            FETCH c WITH (timeout = '5s');
+            """
+        )
+    except ProgrammingError as e:
+        assert "target replica failed or was dropped" in e.args[0]["M"], e
+    else:
+        assert False, "SUBSCRIBE didn't return the expected error"
+
+    dropper.join()
+
+    def kill_replica_with_delay() -> None:
+        time.sleep(2)
+        c.kill("compute_2")
+
+    killer = Thread(target=kill_replica_with_delay)
+    killer.start()
+
+    try:
+        c.sql(
+            """
+            SET cluster = cluster1;
+            SET cluster_replica = replica2;
+            BEGIN;
+            DECLARE c CURSOR FOR SUBSCRIBE t;
+            FETCH c WITH (timeout = '5s');
+            """
+        )
+    except ProgrammingError as e:
+        assert "target replica failed or was dropped" in e.args[0]["M"], e
+    else:
+        assert False, "SUBSCRIBE didn't return the expected error"
+
+    killer.join()

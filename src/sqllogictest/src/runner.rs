@@ -845,7 +845,7 @@ impl RunnerInner {
             frontegg: None,
             cors_allowed_origin: AllowOrigin::list([]),
             unsafe_mode: true,
-            persisted_introspection: true,
+            persisted_introspection: config.persisted_introspection,
             metrics_registry,
             now,
             environment_id,
@@ -853,8 +853,8 @@ impl RunnerInner {
             bootstrap_default_cluster_replica_size: "1".into(),
             bootstrap_builtin_cluster_replica_size: "1".into(),
             bootstrap_system_parameters: Default::default(),
-            storage_host_sizes: Default::default(),
-            default_storage_host_size: None,
+            storage_cluster_sizes: Default::default(),
+            default_storage_cluster_size: None,
             availability_zones: Default::default(),
             connection_context,
             tracing_handle: TracingHandle::disabled(),
@@ -1327,6 +1327,7 @@ pub struct RunConfig<'a> {
     pub no_fail: bool,
     pub fail_fast: bool,
     pub auto_index_tables: bool,
+    pub persisted_introspection: bool,
 }
 
 fn print_record(config: &RunConfig<'_>, record: &Record) {

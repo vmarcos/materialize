@@ -34,6 +34,7 @@ use mz_sql::catalog::{
     CatalogItemType, CatalogType, CatalogTypeDetails, NameReference, TypeReference,
 };
 use mz_storage_client::controller::IntrospectionType;
+use mz_storage_client::healthcheck::{MZ_SINK_STATUS_HISTORY_DESC, MZ_SOURCE_STATUS_HISTORY_DESC};
 
 use crate::catalog::{DEFAULT_CLUSTER_REPLICA_NAME, INTROSPECTION_USER, SYSTEM_USER};
 
@@ -1289,6 +1290,14 @@ pub static MZ_KAFKA_CONNECTIONS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable 
         .with_column("sink_progress_topic", ScalarType::String.nullable(false)),
     is_retained_metrics_relation: false,
 });
+pub static MZ_POSTGRES_SOURCES: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
+    name: "mz_postgres_sources",
+    schema: MZ_INTERNAL_SCHEMA,
+    desc: RelationDesc::empty()
+        .with_column("id", ScalarType::String.nullable(false))
+        .with_column("replication_slot", ScalarType::String.nullable(false)),
+    is_retained_metrics_relation: false,
+});
 pub static MZ_OBJECT_DEPENDENCIES: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
     name: "mz_object_dependencies",
     schema: MZ_INTERNAL_SCHEMA,
@@ -1608,12 +1617,7 @@ pub static MZ_SOURCE_STATUS_HISTORY: Lazy<BuiltinSource> = Lazy::new(|| BuiltinS
     name: "mz_source_status_history",
     schema: MZ_INTERNAL_SCHEMA,
     data_source: Some(IntrospectionType::SourceStatusHistory),
-    desc: RelationDesc::empty()
-        .with_column("occurred_at", ScalarType::TimestampTz.nullable(false))
-        .with_column("source_id", ScalarType::String.nullable(false))
-        .with_column("status", ScalarType::String.nullable(false))
-        .with_column("error", ScalarType::String.nullable(true))
-        .with_column("details", ScalarType::Jsonb.nullable(true)),
+    desc: MZ_SOURCE_STATUS_HISTORY_DESC.clone(),
     is_retained_metrics_relation: false,
 });
 
@@ -1645,12 +1649,7 @@ pub static MZ_SINK_STATUS_HISTORY: Lazy<BuiltinSource> = Lazy::new(|| BuiltinSou
     name: "mz_sink_status_history",
     schema: MZ_INTERNAL_SCHEMA,
     data_source: Some(IntrospectionType::SinkStatusHistory),
-    desc: RelationDesc::empty()
-        .with_column("occurred_at", ScalarType::TimestampTz.nullable(false))
-        .with_column("sink_id", ScalarType::String.nullable(false))
-        .with_column("status", ScalarType::String.nullable(false))
-        .with_column("error", ScalarType::String.nullable(true))
-        .with_column("details", ScalarType::Jsonb.nullable(true)),
+    desc: MZ_SINK_STATUS_HISTORY_DESC.clone(),
     is_retained_metrics_relation: false,
 });
 
@@ -1736,9 +1735,9 @@ pub static MZ_STORAGE_HOST_METRICS: Lazy<BuiltinSource> = Lazy::new(|| BuiltinSo
     // TODO[btv] - make this public once we work out whether and how to fuse it with
     // the corresponding Compute tables.
     schema: MZ_INTERNAL_SCHEMA,
-    data_source: Some(IntrospectionType::StorageHostMetrics),
+    data_source: Some(IntrospectionType::StorageClusterMetrics),
     desc: RelationDesc::empty()
-        // Right now (in production) each storage host is running exactly one
+        // Right now (in production) each storage cluster is running exactly one
         // source or sink, so we identify the hosts by the source/sink id. We
         // have to change this once we allow multiple storage objects to share a
         // "cluster".
@@ -1749,7 +1748,7 @@ pub static MZ_STORAGE_HOST_METRICS: Lazy<BuiltinSource> = Lazy::new(|| BuiltinSo
     is_retained_metrics_relation: true,
 });
 
-// This will be replaced with per-replica tables once source/sink multiplexing on
+// These will be replaced with per-replica tables once source/sink multiplexing on
 // a single cluster is supported.
 pub static MZ_SOURCE_STATISTICS: Lazy<BuiltinSource> = Lazy::new(|| BuiltinSource {
     name: "mz_source_statistics",
@@ -1763,6 +1762,19 @@ pub static MZ_SOURCE_STATISTICS: Lazy<BuiltinSource> = Lazy::new(|| BuiltinSourc
         .with_column("updates_staged", ScalarType::UInt64.nullable(false))
         .with_column("updates_committed", ScalarType::UInt64.nullable(false))
         .with_column("bytes_received", ScalarType::UInt64.nullable(false)),
+    is_retained_metrics_relation: true,
+});
+pub static MZ_SINK_STATISTICS: Lazy<BuiltinSource> = Lazy::new(|| BuiltinSource {
+    name: "mz_sink_statistics",
+    schema: MZ_INTERNAL_SCHEMA,
+    data_source: Some(IntrospectionType::StorageSinkStatistics),
+    desc: RelationDesc::empty()
+        .with_column("id", ScalarType::String.nullable(false))
+        .with_column("worker_id", ScalarType::UInt64.nullable(false))
+        .with_column("messages_staged", ScalarType::UInt64.nullable(false))
+        .with_column("messages_committed", ScalarType::UInt64.nullable(false))
+        .with_column("bytes_staged", ScalarType::UInt64.nullable(false))
+        .with_column("bytes_committed", ScalarType::UInt64.nullable(false)),
     is_retained_metrics_relation: true,
 });
 
@@ -3021,6 +3033,7 @@ pub static BUILTINS_STATIC: Lazy<Vec<Builtin<NameReference>>> = Lazy::new(|| {
         Builtin::Table(&MZ_INDEX_COLUMNS),
         Builtin::Table(&MZ_TABLES),
         Builtin::Table(&MZ_SOURCES),
+        Builtin::Table(&MZ_POSTGRES_SOURCES),
         Builtin::Table(&MZ_SINKS),
         Builtin::Table(&MZ_VIEWS),
         Builtin::Table(&MZ_MATERIALIZED_VIEWS),
@@ -3101,6 +3114,7 @@ pub static BUILTINS_STATIC: Lazy<Vec<Builtin<NameReference>>> = Lazy::new(|| {
         Builtin::Source(&MZ_STORAGE_SHARDS),
         Builtin::Source(&MZ_STORAGE_HOST_METRICS),
         Builtin::Source(&MZ_SOURCE_STATISTICS),
+        Builtin::Source(&MZ_SINK_STATISTICS),
         Builtin::View(&MZ_STORAGE_USAGE),
         Builtin::Table(&MZ_STORAGE_HOST_SIZES),
         Builtin::View(&MZ_SOURCE_UTILIZATION),

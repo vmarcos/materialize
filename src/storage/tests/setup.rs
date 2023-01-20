@@ -76,11 +76,16 @@
 
 //! Unit tests for sources.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::{Send, Sync};
+use std::rc::Rc;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
+use mz_ore::halt;
+use mz_storage::internal_control::{InternalCommandSender, InternalStorageCommand};
 use timely::progress::{Antichain, Timestamp as _};
 
 use mz_build_info::DUMMY_BUILD_INFO;
@@ -88,12 +93,12 @@ use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::SYSTEM_TIME;
 use mz_ore::task::RuntimeExt;
 use mz_repr::TimestampManipulation;
-use mz_repr::{Diff, GlobalId, Timestamp};
+use mz_repr::{Diff, GlobalId, RelationDesc, Timestamp};
 use mz_storage::sink::SinkBaseMetrics;
 use mz_storage::source::metrics::SourceBaseMetrics;
 use mz_storage::source::testscript::ScriptCommand;
+use mz_storage::storage_state::async_storage_worker::AsyncStorageWorker;
 use mz_storage::DecodeMetrics;
-use mz_storage_client::client::StorageCommand;
 use mz_storage_client::types::sources::{
     encoding::SourceDataEncoding, GenericSourceConnection, SourceData, SourceDesc, SourceEnvelope,
     TestScriptSourceConnection,
@@ -226,12 +231,14 @@ where
                     aws_external_id_prefix: None,
                     secrets_reader: Arc::new(mz_secrets::InMemorySecretsController::new()),
                 },
-                persist_clients,
+                persist_clients: Arc::clone(&persist_clients),
                 sink_tokens: HashMap::new(),
                 sink_write_frontiers: HashMap::new(),
                 sink_handles: HashMap::new(),
                 dropped_ids: Vec::new(),
                 source_statistics: HashMap::new(),
+                sink_statistics: HashMap::new(),
+                internal_cmd_tx: HaltingInternalCommandSender::new(),
             };
 
             let (_fake_tx, fake_rx) = crossbeam_channel::bounded(1);
@@ -245,6 +252,9 @@ where
                 remap_shard: mz_persist_client::ShardId::new(),
                 data_shard: mz_persist_client::ShardId::new(),
                 status_shard: None,
+                // TODO(guswynn|danhhz): replace this with a real desc when persist requires a
+                // schema.
+                relation_desc: RelationDesc::empty(),
             };
             let data_shard = collection_metadata.data_shard.clone();
             let id = GlobalId::User(1);
@@ -258,24 +268,35 @@ where
 
             {
                 let _tokio_guard = tokio_runtime.enter();
-                worker.handle_storage_command(StorageCommand::CreateSources(vec![
-                    mz_storage_client::client::CreateSourceCommand {
+
+                let mut async_storage_worker =
+                    AsyncStorageWorker::new(thread::current(), Arc::clone(&persist_clients));
+
+                // NOTE: We only feed internal commands into the worker,
+                // bypassing "external" StorageCommand and the async worker that
+                // also sits into the normal processing loop. If you ever
+                // encounter weird behaviour from this test, this might be the
+                // reason.
+                worker.handle_internal_storage_command(
+                    &mut async_storage_worker,
+                    InternalStorageCommand::CreateIngestionDataflow {
                         id,
-                        description: mz_storage_client::types::sources::IngestionDescription {
-                            desc: desc.clone(),
-                            ingestion_metadata: collection_metadata,
-                            source_exports,
-                            // Only used for Debezium
-                            source_imports: BTreeMap::new(),
-                            host_config:
-                                mz_storage_client::types::hosts::StorageHostConfig::Remote {
-                                    addr: "test".to_string(),
-                                },
-                        },
+                        ingestion_description:
+                            mz_storage_client::types::sources::IngestionDescription {
+                                desc: desc.clone(),
+                                ingestion_metadata: collection_metadata,
+                                source_exports,
+                                // Only used for Debezium
+                                source_imports: BTreeMap::new(),
+                                cluster_config:
+                                    mz_storage_client::types::clusters::StorageClusterConfig::Remote {
+                                        addr: "test".to_string(),
+                                    },
+                            },
                         // TODO: test resumption as well!
-                        resume_upper: Antichain::from_elem(Timestamp::minimum()),
+                        resumption_frontier: Antichain::from_elem(Timestamp::minimum()),
                     },
-                ]));
+                );
             }
 
             // Run the assertions in a tokio task, so we can step the dataflow
@@ -285,9 +306,12 @@ where
                 (&tokio_runtime).spawn_named(|| "check_loop".to_string(), async move {
                     loop {
                         let (mut data_write_handle, data_read_handle) = persist_client
-                            .open::<SourceData, (), Timestamp, Diff>(
+                            .open::<SourceData, (), Timestamp, Diff, _>(
                                 data_shard.clone(),
                                 "tests::check_loop",
+                                // TODO(guswynn|danhhz): replace this with a real desc when persist requires a
+                                // schema.
+                                RelationDesc::empty(),
                             )
                             .await
                             .unwrap();
@@ -338,4 +362,18 @@ where
 
     // There is always exactly one worker.
     Ok(value.unwrap())
+}
+
+struct HaltingInternalCommandSender {}
+
+impl HaltingInternalCommandSender {
+    fn new() -> Option<Rc<RefCell<dyn InternalCommandSender>>> {
+        Some(Rc::new(RefCell::new(HaltingInternalCommandSender {})))
+    }
+}
+
+impl InternalCommandSender for HaltingInternalCommandSender {
+    fn broadcast(&mut self, internal_cmd: mz_storage::internal_control::InternalStorageCommand) {
+        halt!("got unexpected {:?} during testing", internal_cmd);
+    }
 }

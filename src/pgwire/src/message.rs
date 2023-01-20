@@ -338,8 +338,8 @@ impl ErrorResponse {
             AdapterError::InvalidParameterValue { .. } => SqlState::INVALID_PARAMETER_VALUE,
             AdapterError::InvalidClusterReplicaAz { .. } => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::InvalidClusterReplicaSize { .. } => SqlState::FEATURE_NOT_SUPPORTED,
-            AdapterError::InvalidStorageHostSize { .. } => SqlState::FEATURE_NOT_SUPPORTED,
-            AdapterError::StorageHostSizeRequired { .. } => SqlState::FEATURE_NOT_SUPPORTED,
+            AdapterError::InvalidStorageClusterSize { .. } => SqlState::FEATURE_NOT_SUPPORTED,
+            AdapterError::SourceOrSinkSizeRequired { .. } => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::InvalidTableMutationSelection => SqlState::INVALID_TRANSACTION_STATE,
             AdapterError::ConstraintViolation(NotNullViolation(_)) => SqlState::NOT_NULL_VIOLATION,
             AdapterError::NoClusterReplicasAvailable(_) => SqlState::FEATURE_NOT_SUPPORTED,
@@ -347,7 +347,6 @@ impl ErrorResponse {
             AdapterError::OperationRequiresTransaction(_) => SqlState::NO_ACTIVE_SQL_TRANSACTION,
             AdapterError::PlanError(_) => SqlState::INTERNAL_ERROR,
             AdapterError::PreparedStatementExists(_) => SqlState::DUPLICATE_PSTATEMENT,
-            AdapterError::QGM(_) => SqlState::INTERNAL_ERROR,
             AdapterError::ReadOnlyTransaction => SqlState::READ_ONLY_SQL_TRANSACTION,
             AdapterError::ReadOnlyParameter(_) => SqlState::CANT_CHANGE_RUNTIME_PARAM,
             AdapterError::ReadWriteUnavailable => SqlState::INVALID_TRANSACTION_STATE,
@@ -375,7 +374,6 @@ impl ErrorResponse {
             AdapterError::Unsupported(..) => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::Unstructured(_) => SqlState::INTERNAL_ERROR,
             AdapterError::UntargetedLogRead { .. } => SqlState::FEATURE_NOT_SUPPORTED,
-            AdapterError::TargetedSubscribe { .. } => SqlState::FEATURE_NOT_SUPPORTED,
             // It's not immediately clear which error code to use here because a
             // "write-only transaction" and "single table write transaction" are
             // not things in Postgres. This error code is the generic "bad txn thing"

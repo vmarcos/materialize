@@ -23,6 +23,7 @@
 #![allow(clippy::needless_borrow)]
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -52,12 +53,13 @@ use tracing::{info, trace, warn};
 
 use mz_expr::PartitionId;
 use mz_ore::cast::CastFrom;
-use mz_ore::halt;
 use mz_ore::now::NowFn;
 use mz_ore::vec::VecExt;
 use mz_persist_client::cache::PersistClientCache;
-use mz_repr::{Diff, GlobalId, Timestamp};
+use mz_repr::{Diff, GlobalId, RelationDesc, Timestamp};
+use mz_storage_client::client::SourceStatisticsUpdate;
 use mz_storage_client::controller::{CollectionMetadata, ResumptionFrontierCalculator};
+use mz_storage_client::healthcheck::MZ_SOURCE_STATUS_HISTORY_DESC;
 use mz_storage_client::source::util::async_source;
 use mz_storage_client::types::connections::ConnectionContext;
 use mz_storage_client::types::errors::SourceError;
@@ -68,13 +70,14 @@ use mz_timely_util::builder_async::{Event, OperatorBuilder as AsyncOperatorBuild
 use mz_timely_util::operator::StreamExt as _;
 
 use crate::healthcheck::write_to_persist;
-
+use crate::internal_control::{InternalCommandSender, InternalStorageCommand};
 use crate::source::metrics::SourceBaseMetrics;
 use crate::source::reclock::{ReclockBatch, ReclockError, ReclockFollower, ReclockOperator};
 use crate::source::types::{
     HealthStatusUpdate, MaybeLength, SourceConnectionBuilder, SourceMessage, SourceMessageType,
     SourceMetrics, SourceOutput, SourceReader, SourceReaderError, SourceReaderMetrics,
 };
+use crate::statistics::{SourceStatisticsMetrics, StorageStatistics};
 
 // Interval after which the source operator will yield control.
 const YIELD_INTERVAL: Duration = Duration::from_millis(10);
@@ -109,7 +112,7 @@ pub struct RawSourceCreationConfig {
     /// A handle to the persist client cache
     pub persist_clients: Arc<Mutex<PersistClientCache>>,
     /// Place to share statistics updates with storage state.
-    pub source_statistics: crate::source::statistics::SourceStatistics,
+    pub source_statistics: StorageStatistics<SourceStatisticsUpdate, SourceStatisticsMetrics>,
 }
 
 /// A batch of messages from a source reader, along with the batch upper, the
@@ -166,6 +169,7 @@ pub fn create_raw_source<G, C, R>(
     source_connection: C,
     connection_context: ConnectionContext,
     calc: R,
+    internal_cmd_tx: Rc<RefCell<dyn InternalCommandSender>>,
 ) -> (
     (
         Vec<
@@ -221,8 +225,13 @@ where
         &resume_stream,
     );
 
-    let (remap_stream, remap_token) =
-        remap_operator(scope, config.clone(), batch_upper_summaries, &resume_stream);
+    let (remap_stream, remap_token) = remap_operator(
+        scope,
+        config.clone(),
+        batch_upper_summaries,
+        &resume_stream,
+        C::REMAP_RELATION_DESC.clone(),
+    );
 
     let ((reclocked_stream, reclocked_err_stream), _reclock_token) = reclock_operator(
         scope,
@@ -232,7 +241,7 @@ where
         remap_stream,
     );
 
-    let health_token = health_operator(scope, config, health_stream);
+    let health_token = health_operator(scope, config, health_stream, internal_cmd_tx);
 
     let token = Rc::new((source_reader_token, remap_token, resume_token, health_token));
 
@@ -689,6 +698,7 @@ where
                             return;
                         }
                     };
+
                     let SourceReaderOperatorOutput {
                         messages,
                         status_update,
@@ -868,6 +878,7 @@ fn health_operator<G>(
     scope: &G,
     config: RawSourceCreationConfig,
     health_stream: Stream<G, (usize, HealthStatusUpdate)>,
+    internal_cmd_tx: Rc<RefCell<dyn InternalCommandSender>>,
 ) -> Rc<dyn Any>
 where
     G: Scope<Timestamp = Timestamp>,
@@ -917,7 +928,15 @@ where
         if is_active_worker {
             if let Some(status_shard) = storage_metadata.status_shard {
                 info!("Health for source {source_id} being written to {status_shard}");
-                write_to_persist(source_id, last_reported_status.name(), last_reported_status.error(), now.clone(), &persist_client, status_shard).await;
+                write_to_persist(
+                    source_id,
+                    last_reported_status.name(),
+                    last_reported_status.error(),
+                    now.clone(),
+                    &persist_client,
+                    status_shard,
+                    &*MZ_SOURCE_STATUS_HISTORY_DESC
+                ).await;
             } else {
                 info!("Health for source {source_id} not being written to status shard");
             }
@@ -945,13 +964,26 @@ where
                 if &last_reported_status != new_status {
                     info!("Health transition for source {source_id}: {last_reported_status:?} -> {new_status:?}");
                     if let Some(status_shard) = storage_metadata.status_shard {
-                        write_to_persist(source_id, new_status.name(), new_status.error(), now.clone(), &persist_client, status_shard).await;
+                        write_to_persist(
+                            source_id,
+                            new_status.name(),
+                            new_status.error(),
+                            now.clone(),
+                            &persist_client,
+                            status_shard,
+                            &*MZ_SOURCE_STATUS_HISTORY_DESC
+                        ).await;
                     }
 
                     last_reported_status = new_status.clone();
                 }
+                // TODO(aljoscha): Instead of threading through the
+                // `should_halt` bit, we can give an internal command sender
+                // directly to the places where `should_halt = true` originates.
+                // We should definitely do that, but this is okay for a PoC.
                 if let Some(halt_with) = halt_with {
-                    halt!("halting with status {halt_with:?}");
+                    info!("Broadcasting suspend-and-restart command because of {:?}", halt_with);
+                    internal_cmd_tx.borrow_mut().broadcast(InternalStorageCommand::SuspendAndRestart(source_id));
                 }
             }
         }
@@ -1019,6 +1051,7 @@ fn remap_operator<G, FromTime>(
     config: RawSourceCreationConfig,
     batch_upper_summaries: Stream<G, BatchUpperSummary>,
     resume_stream: &Stream<G, ()>,
+    remap_relation_desc: RelationDesc,
 ) -> (Stream<G, (FromTime, Timestamp, Diff)>, Rc<dyn Any>)
 where
     G: Scope<Timestamp = Timestamp>,
@@ -1090,6 +1123,7 @@ where
             "remap",
             worker_id,
             worker_count,
+            remap_relation_desc,
         )
         .await
         .unwrap_or_else(|e| panic!("Failed to create remap handle for source {}: {:#}", name, e));

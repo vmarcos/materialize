@@ -28,9 +28,10 @@ use mz_sql::ast::{CreateIndexStatement, Statement};
 use mz_sql::catalog::{CatalogDatabase, CatalogType, TypeCategory};
 use mz_sql::names::{ResolvedDatabaseSpecifier, SchemaId, SchemaSpecifier};
 use mz_sql_parser::ast::display::AstDisplay;
+use mz_storage_client::types::clusters::StorageClusterResourceAllocation;
 use mz_storage_client::types::connections::KafkaConnection;
-use mz_storage_client::types::hosts::{StorageHostConfig, StorageHostResourceAllocation};
 use mz_storage_client::types::sinks::{KafkaSinkConnection, StorageSinkConnection};
+use mz_storage_client::types::sources::{GenericSourceConnection, PostgresSourceConnection};
 
 use crate::catalog::builtin::{
     MZ_ARRAY_TYPES, MZ_AUDIT_EVENTS, MZ_BASE_TYPES, MZ_CLUSTERS, MZ_CLUSTER_LINKS,
@@ -38,18 +39,18 @@ use crate::catalog::builtin::{
     MZ_CLUSTER_REPLICA_METRICS, MZ_CLUSTER_REPLICA_STATUSES, MZ_COLUMNS, MZ_CONNECTIONS,
     MZ_DATABASES, MZ_EGRESS_IPS, MZ_FUNCTIONS, MZ_INDEXES, MZ_INDEX_COLUMNS, MZ_KAFKA_CONNECTIONS,
     MZ_KAFKA_SINKS, MZ_LIST_TYPES, MZ_MAP_TYPES, MZ_MATERIALIZED_VIEWS, MZ_OBJECT_DEPENDENCIES,
-    MZ_PSEUDO_TYPES, MZ_ROLES, MZ_SCHEMAS, MZ_SECRETS, MZ_SINKS, MZ_SOURCES,
+    MZ_POSTGRES_SOURCES, MZ_PSEUDO_TYPES, MZ_ROLES, MZ_SCHEMAS, MZ_SECRETS, MZ_SINKS, MZ_SOURCES,
     MZ_SSH_TUNNEL_CONNECTIONS, MZ_STORAGE_USAGE_BY_SHARD, MZ_TABLES, MZ_TYPES, MZ_VIEWS,
 };
 use crate::catalog::{
-    CatalogItem, CatalogState, Connection, Database, Error, ErrorKind, Func, Index,
+    CatalogItem, CatalogState, Connection, DataSourceDesc, Database, Error, ErrorKind, Func, Index,
     MaterializedView, Role, Sink, StorageSinkConnectionState, Type, View, SYSTEM_CONN_ID,
 };
 
 use super::builtin::{
     MZ_AWS_PRIVATELINK_CONNECTIONS, MZ_CLUSTER_REPLICA_SIZES, MZ_STORAGE_HOST_SIZES,
 };
-use super::{AwsPrincipalContext, DataSourceDesc, Ingestion};
+use super::AwsPrincipalContext;
 
 /// An update to a built-in table.
 #[derive(Debug)]
@@ -244,23 +245,31 @@ impl CatalogState {
                 let connection_id = source.connection_id();
                 let envelope = source.envelope();
 
-                self.pack_source_update(
+                let mut updates = self.pack_source_update(
                     id,
                     oid,
                     schema_id,
                     name,
                     source_type,
                     connection_id,
-                    match &source.data_source {
-                        DataSourceDesc::Ingestion(Ingestion {
-                            host_config: StorageHostConfig::Managed { size, .. },
-                            ..
-                        }) => Some(size.as_str()),
-                        _ => None,
-                    },
+                    self.get_storage_cluster_config(id)
+                        .as_ref()
+                        .and_then(|s| s.size()),
                     envelope,
                     diff,
-                )
+                );
+
+                updates.extend(match &source.data_source {
+                    DataSourceDesc::Ingestion(ingestion) => match &ingestion.desc.connection {
+                        GenericSourceConnection::Postgres(postgres) => {
+                            self.pack_postgres_source_update(id, postgres, diff)
+                        }
+                        _ => vec![],
+                    },
+                    _ => vec![],
+                });
+
+                updates
             }
             CatalogItem::View(view) => self.pack_view_update(id, oid, schema_id, name, view, diff),
             CatalogItem::MaterializedView(mview) => {
@@ -349,6 +358,22 @@ impl CatalogState {
                 Datum::from(connection_id.map(|id| id.to_string()).as_deref()),
                 Datum::from(size),
                 Datum::from(envelope),
+            ]),
+            diff,
+        }]
+    }
+
+    fn pack_postgres_source_update(
+        &self,
+        id: GlobalId,
+        postgres: &PostgresSourceConnection,
+        diff: Diff,
+    ) -> Vec<BuiltinTableUpdate> {
+        vec![BuiltinTableUpdate {
+            id: self.resolve_builtin_table(&MZ_POSTGRES_SOURCES),
+            row: Row::pack_slice(&[
+                Datum::String(&id.to_string()),
+                Datum::String(&postgres.publication_details.slot),
             ]),
             diff,
         }]
@@ -593,7 +618,11 @@ impl CatalogState {
                     Datum::String(name),
                     Datum::String(connection.name()),
                     Datum::from(sink.connection_id().map(|id| id.to_string()).as_deref()),
-                    Datum::from(sink.host_config.size()),
+                    Datum::from(
+                        self.get_storage_cluster_config(id)
+                            .as_ref()
+                            .and_then(|c| c.size()),
+                    ),
                 ]),
                 diff,
             });
@@ -958,13 +987,13 @@ impl CatalogState {
     pub fn pack_all_storage_host_size_updates(&self) -> Vec<BuiltinTableUpdate> {
         let id = self.resolve_builtin_table(&MZ_STORAGE_HOST_SIZES);
         let updates = self
-            .storage_host_sizes
+            .storage_cluster_sizes
             .0
             .iter()
             .map(
                 |(
                     size,
-                    StorageHostResourceAllocation {
+                    StorageClusterResourceAllocation {
                         memory_limit,
                         cpu_limit,
                         workers,

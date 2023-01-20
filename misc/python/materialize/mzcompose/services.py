@@ -9,7 +9,10 @@
 
 import os
 import random
+import tempfile
 from typing import Dict, List, Optional, Tuple, Union
+
+import toml
 
 from materialize import ROOT
 from materialize.mzcompose import Service, ServiceConfig, ServiceDependency, loader
@@ -25,7 +28,6 @@ LINT_DEBEZIUM_VERSIONS = ["1.4", "1.5", "1.6"]
 
 DEFAULT_MZ_VOLUMES = [
     "mzdata:/mzdata",
-    "pgdata:/cockroach-data",
     "mydata:/var/lib/mysql-files",
     "tmp:/share/tmp",
 ]
@@ -388,12 +390,19 @@ class MySql(Service):
 
 
 class Cockroach(Service):
+    DEFAULT_COCKROACH_TAG = "v22.2.0"
+
     def __init__(
         self,
         name: str = "cockroach",
-        setup_materialize: bool = False,
+        image: Optional[str] = None,
+        setup_materialize: bool = True,
     ):
         volumes = []
+
+        if image is None:
+            image = f"cockroachdb/cockroach:{Cockroach.DEFAULT_COCKROACH_TAG}"
+
         if setup_materialize:
             path = os.path.relpath(
                 ROOT / "misc" / "cockroach" / "setup_materialize.sql",
@@ -403,7 +412,7 @@ class Cockroach(Service):
         super().__init__(
             name=name,
             config={
-                "image": "cockroachdb/cockroach:v22.2.0",
+                "image": image,
                 "ports": [26257],
                 "command": ["start-single-node", "--insecure"],
                 "volumes": volumes,
@@ -610,12 +619,11 @@ class Testdrive(Service):
         default_timeout: str = "120s",
         seed: Optional[int] = None,
         consistent_seed: bool = False,
-        validate_postgres_stash: bool = False,
+        validate_postgres_stash: Optional[str] = None,
         entrypoint: Optional[List[str]] = None,
         entrypoint_extra: List[str] = [],
         environment: Optional[List[str]] = None,
-        volumes: Optional[List[str]] = None,
-        volumes_extra: Optional[List[str]] = None,
+        volumes_extra: List[str] = [],
         volume_workdir: str = ".:/workdir",
         propagate_uid_gid: bool = True,
         forward_buildkite_shard: bool = False,
@@ -638,11 +646,12 @@ class Testdrive(Service):
                 "AWS_SESSION_TOKEN",
             ]
 
-        if volumes is None:
-            volumes = [*DEFAULT_MZ_VOLUMES]
+        volumes = [
+            volume_workdir,
+            *(v for v in DEFAULT_MZ_VOLUMES if v.startswith("tmp:")),
+        ]
         if volumes_extra:
             volumes.extend(volumes_extra)
-        volumes.append(volume_workdir)
 
         if entrypoint is None:
             entrypoint = [
@@ -661,7 +670,7 @@ class Testdrive(Service):
 
         if validate_postgres_stash:
             entrypoint.append(
-                "--validate-postgres-stash=postgres://root@materialized:26257?options=--search_path=adapter"
+                f"--validate-postgres-stash=postgres://root@{validate_postgres_stash}:26257?options=--search_path=adapter"
             )
 
         if no_reset:
@@ -793,5 +802,50 @@ class SshBastionHost(Service):
                     "SSH_USERS=mz:1000:1000",
                     "TCP_FORWARDING=true",
                 ],
+            },
+        )
+
+
+class Mz(Service):
+    def __init__(
+        self,
+        *,
+        name: str = "mz",
+        region: str = "aws/us-east-1",
+        environment: str = "staging",
+        username: str,
+        app_password: str,
+    ) -> None:
+        # We must create the temporary config file in a location
+        # that is accessible on the same path in both the ci-builder
+        # container and the host that runs the docker daemon
+        # $TMP does not guarantee that, but loader.composition_path does.
+        config = tempfile.NamedTemporaryFile(
+            dir=loader.composition_path,
+            prefix="tmp_",
+            suffix=".toml",
+            mode="w",
+            delete=False,
+        )
+        toml.dump(
+            {
+                "current_profile": "default",
+                "profiles": {
+                    "default": {
+                        "email": username,
+                        "app-password": app_password,
+                        "region": region,
+                        "endpoint": f"https://{environment}.cloud.materialize.com/",
+                    },
+                },
+            },
+            config,
+        )
+        config.close()
+        super().__init__(
+            name=name,
+            config={
+                "mzbuild": "mz",
+                "volumes": [f"{config.name}:/root/.config/mz/profiles.toml"],
             },
         )

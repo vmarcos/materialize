@@ -64,7 +64,7 @@ use crate::{PersistLocation, ShardId};
 /// using [`timely::dataflow::operators::generic::operator::empty`].
 ///
 /// [advanced by]: differential_dataflow::lattice::Lattice::advance_by
-pub fn shard_source<K, V, D, G>(
+pub fn shard_source<K, V, D, G, S>(
     scope: &G,
     name: &str,
     clients: Arc<Mutex<PersistClientCache>>,
@@ -73,8 +73,10 @@ pub fn shard_source<K, V, D, G>(
     as_of: Option<Antichain<G::Timestamp>>,
     until: Antichain<G::Timestamp>,
     flow_control: Option<FlowControl<G>>,
+    schema: S,
 ) -> (Stream<G, FetchedPart<K, V, G::Timestamp, D>>, Rc<dyn Any>)
 where
+    S: Clone + 'static,
     K: Debug + Codec,
     V: Debug + Codec,
     D: Semigroup + Codec64 + Send + Sync,
@@ -108,7 +110,7 @@ where
     ) = mpsc::unbounded_channel();
 
     let chosen_worker = usize::cast_from(name.hashed()) % scope.peers();
-    let (descs, descs_shutdown) = shard_source_descs::<K, V, D, G>(
+    let (descs, descs_shutdown) = shard_source_descs::<K, V, D, G, _>(
         scope,
         name,
         Arc::clone(&clients),
@@ -119,15 +121,12 @@ where
         flow_control,
         consumed_part_rx,
         chosen_worker,
+        schema.clone(),
     );
-    let (parts, tokens, fetch_shutdown) =
-        shard_source_fetch(&descs, name, clients, location, shard_id);
+    let (parts, tokens) = shard_source_fetch(&descs, name, clients, location, shard_id, schema);
     shard_source_tokens(&tokens, name, consumed_part_tx, chosen_worker);
 
-    let token = Rc::new((
-        descs_shutdown.press_on_drop(),
-        fetch_shutdown.press_on_drop(),
-    ));
+    let token = Rc::new(descs_shutdown.press_on_drop());
     (parts, token)
 }
 
@@ -144,7 +143,7 @@ pub struct FlowControl<G: Scope> {
     pub max_inflight_bytes: usize,
 }
 
-pub(crate) fn shard_source_descs<K, V, D, G>(
+pub(crate) fn shard_source_descs<K, V, D, G, S>(
     scope: &G,
     name: &str,
     clients: Arc<Mutex<PersistClientCache>>,
@@ -155,8 +154,10 @@ pub(crate) fn shard_source_descs<K, V, D, G>(
     flow_control: Option<FlowControl<G>>,
     mut consumed_part_rx: mpsc::UnboundedReceiver<SerdeLeasedBatchPart>,
     chosen_worker: usize,
+    schema: S,
 ) -> (Stream<G, (usize, SerdeLeasedBatchPart)>, ShutdownButton<()>)
 where
+    S: 'static,
     K: Debug + Codec,
     V: Debug + Codec,
     D: Semigroup + Codec64 + Send + Sync,
@@ -186,9 +187,10 @@ where
         };
         let read = read
             .expect("location should be valid")
-            .open_leased_reader::<K, V, G::Timestamp, D>(
+            .open_leased_reader::<K, V, G::Timestamp, D, _>(
                 shard_id,
                 &format!("shard_source({})", name_owned),
+                schema,
             )
             .await
             .expect("could not open persist shard");
@@ -307,21 +309,26 @@ where
                         let mut descs_output = descs_output.activate();
                         let mut descs_session = descs_output.session(&session_cap);
 
-                        let mut bytes_emitted = 0;
-
-                        for part_desc in std::mem::take(&mut batch_parts) {
-                            bytes_emitted += part_desc.encoded_size_bytes();
-                            // Give the part to a random worker. This isn't
-                            // round robin in an attempt to avoid skew issues:
-                            // if your parts alternate size large, small, then
-                            // you'll end up only using half of your workers.
-                            //
-                            // There's certainly some other things we could be
-                            // doing instead here, but this has seemed to work
-                            // okay so far. Continue to revisit as necessary.
-                            let worker_idx = usize::cast_from(Instant::now().hashed()) % num_workers;
-                            descs_session.give((worker_idx, part_desc.into_exchangeable_part()));
-                        }
+                        // NB: in order to play nice with downstream operators whose invariants
+                        // depend on seeing the full contents of an individual batch, we must
+                        // atomically emit all parts here (e.g. no awaits).
+                        let bytes_emitted = {
+                            let mut bytes_emitted = 0;
+                            for part_desc in std::mem::take(&mut batch_parts) {
+                                bytes_emitted += part_desc.encoded_size_bytes();
+                                // Give the part to a random worker. This isn't
+                                // round robin in an attempt to avoid skew issues:
+                                // if your parts alternate size large, small, then
+                                // you'll end up only using half of your workers.
+                                //
+                                // There's certainly some other things we could be
+                                // doing instead here, but this has seemed to work
+                                // okay so far. Continue to revisit as necessary.
+                                let worker_idx = usize::cast_from(Instant::now().hashed()) % num_workers;
+                                descs_session.give((worker_idx, part_desc.into_exchangeable_part()));
+                            }
+                            bytes_emitted
+                        };
 
                         // Only track in-flight parts if flow control is enabled. Otherwise we
                         // would leak memory, as tracked parts would never be drained.
@@ -401,18 +408,19 @@ where
     (descs_stream, shutdown_button)
 }
 
-pub(crate) fn shard_source_fetch<K, V, T, D, G>(
+pub(crate) fn shard_source_fetch<K, V, T, D, G, S>(
     descs: &Stream<G, (usize, SerdeLeasedBatchPart)>,
     name: &str,
     clients: Arc<Mutex<PersistClientCache>>,
     location: PersistLocation,
     shard_id: ShardId,
+    schema: S,
 ) -> (
     Stream<G, FetchedPart<K, V, T, D>>,
     Stream<G, SerdeLeasedBatchPart>,
-    ShutdownButton<()>,
 )
 where
+    S: 'static,
     K: Debug + Codec,
     V: Debug + Codec,
     T: Timestamp + Lattice + Codec64,
@@ -428,7 +436,22 @@ where
     let (mut fetched_output, fetched_stream) = builder.new_output();
     let (mut tokens_output, tokens_stream) = builder.new_output();
 
-    let shutdown_button = builder.build(move |_capabilities| async move {
+    // NB: we intentionally do _not_ pass along the shutdown button here so that
+    // we can be assured we always emit the full contents of a batch. If we used
+    // the shutdown token, on Drop, it is possible we'd only partially emit the
+    // contents of a batch which could lead to downstream operators seeing records
+    // and collections that never existed, which may break their invariants.
+    //
+    // The downside of this approach is that we may be left doing (considerable)
+    // work if the dataflow is dropped but we have a large numbers of parts left
+    // in the batch to fetch and yield.
+    //
+    // This also means that a pre-requisite to this operator is for the input to
+    // atomically provide the parts for each batch.
+    //
+    // Note that this requirement would not be necessary if we were emitting
+    // fully consolidated data: https://github.com/MaterializeInc/materialize/issues/16860#issuecomment-1366094925
+    let _shutdown_button = builder.build(move |_capabilities| async move {
         let fetcher = {
             let mut clients = clients.lock().await;
 
@@ -440,7 +463,9 @@ where
             // Unlock the client cache before we do any async work.
             std::mem::drop(clients);
 
-            client.create_batch_fetcher::<K, V, T, D>(shard_id).await
+            client
+                .create_batch_fetcher::<K, V, T, D, _>(shard_id, schema)
+                .await
         };
 
         let mut buffer = Vec::new();
@@ -474,7 +499,7 @@ where
         }
     });
 
-    (fetched_stream, tokens_stream, shutdown_button)
+    (fetched_stream, tokens_stream)
 }
 
 pub(crate) fn shard_source_tokens<T, G>(
